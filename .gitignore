@@ -1,0 +1,33 @@
+# Large datasets & raw files
+data/
+dataset/
+*.tsv
+*.csv
+*.zip
+*.tar.gz
+
+# Model artifacts & experiment outputs
+output/
+*.pkl
+*.model
+
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter & IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SageMaker / Cloud
+.sagemaker/
+.aws/
