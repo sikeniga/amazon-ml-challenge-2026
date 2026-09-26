@@ -7,6 +7,18 @@ Key responsibilities:
   - Clean and normalize business names (abbreviation expansion, punctuation, lower-case)
   - Clean and normalize addresses (abbreviation expansion, token sorting)
   - Provide tokenized versions for downstream similarity features
+
+Performance notes (fixed):
+  - _apply_abbrev used to run one re.sub() PER abbreviation (30 for names, 24 for
+    addresses), each scanning the full string. That is 30/24 full passes per row,
+    which does not scale to millions of rows. It is now a single compiled
+    alternation regex -> one pass per string.
+  - normalize_name/normalize_address used to rely on functools.lru_cache(32768).
+    With 2M+ unique business names, a cache that small gets evicted constantly
+    and provides little benefit. preprocess_dataframe now normalizes only the
+    *unique* values in each column and maps the results back, which is a much
+    bigger win than lru_cache at this cardinality (repeats are common, but the
+    unique count still exceeds a small LRU cache).
 """
 
 import re
@@ -42,7 +54,6 @@ NAME_ABBREV = {
     r"\bassoc\b": "associates",
     r"\bassn\b": "association",
     r"\bdept\b": "department",
-    r"\b&\b": "and",
     r"\bgrp\b": "group",
     r"\btech\b": "technology",
     r"\bsoln\b": "solution",
@@ -92,7 +103,51 @@ def _unicode_normalize(text: str) -> str:
     return nfkd.encode("ascii", "ignore").decode("ascii")
 
 
+def _compile_abbrev(abbrev_map: dict):
+    """
+    Combine many `\\bword\\b -> replacement` rules into ONE compiled
+    alternation regex, so each string is scanned once instead of once
+    per abbreviation.
+
+    Multi-word patterns like `\\bint l\\b` are supported: the literal
+    inner text (with internal whitespace normalized to a single space)
+    is used as the alternative and matched as-is.
+    """
+    lookup = {}
+    parts = []
+    for pattern, replacement in abbrev_map.items():
+        # Strip a leading/trailing \b and normalize internal whitespace
+        # (handles both "\bword\b" and "\bmulti word\b" cases).
+        word = pattern
+        if word.startswith(r"\b"):
+            word = word[2:]
+        if word.endswith(r"\b"):
+            word = word[:-2]
+        word = re.sub(r"\s+", " ", word).strip()
+        lookup[word] = replacement
+        parts.append(re.escape(word).replace(r"\ ", r"\s+"))
+
+    # Longer alternatives first so multi-word patterns aren't shadowed
+    # by a shorter single-word prefix.
+    parts.sort(key=len, reverse=True)
+    combined = re.compile(r"\b(" + "|".join(parts) + r")\b")
+
+    def _sub(text: str) -> str:
+        def _repl(m: "re.Match") -> str:
+            key = re.sub(r"\s+", " ", m.group(0)).strip()
+            return lookup.get(key, m.group(0))
+        return combined.sub(_repl, text)
+
+    return _sub
+
+
+_apply_name_abbrev = _compile_abbrev(NAME_ABBREV)
+_apply_address_abbrev = _compile_abbrev(ADDRESS_ABBREV)
+
+
 def _apply_abbrev(text: str, abbrev_map: dict) -> str:
+    """Kept for backwards compatibility / debugging (slow path, not used
+    internally anymore)."""
     for pattern, replacement in abbrev_map.items():
         text = re.sub(pattern, replacement, text)
     return text
@@ -108,9 +163,10 @@ def normalize_name(name: str) -> str:
         return ""
     text = _unicode_normalize(name)
     text = text.lower()
+    text = re.sub(r"&", " and ", text)
     text = re.sub(r"[^\w\s'-]", " ", text)
     text = re.sub(r"[-']", " ", text)
-    text = _apply_abbrev(text, NAME_ABBREV)
+    text = _apply_name_abbrev(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -148,7 +204,7 @@ def normalize_address(address: str) -> str:
     text = _unicode_normalize(address)
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
-    text = _apply_abbrev(text, ADDRESS_ABBREV)
+    text = _apply_address_abbrev(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -191,14 +247,59 @@ def normalize_country(country: str) -> str:
 # DataFrame-level application
 # ---------------------------------------------------------------------------
 
-def preprocess_dataframe(df):
+def _map_via_unique(series, func, label=""):
+    """
+    Apply `func` to only the unique values of `series`, then map results
+    back. Much faster than series.map(func) directly when there are many
+    repeated values and/or the value cardinality exceeds a small
+    lru_cache, since each distinct value is computed exactly once
+    regardless of cache size or eviction.
+    """
+    uniques = series.unique()
+    if label:
+        print(f"    {label}: {len(series):,} rows -> {len(uniques):,} unique values")
+    mapping = {v: func(v) for v in uniques}
+    return series.map(mapping)
+
+
+def preprocess_dataframe(df, verbose: bool = True):
     df = df.copy()
-    df["norm_name"] = df["business_name"].fillna("").map(normalize_name)
-    df["norm_address"] = df["business_address"].fillna("").map(normalize_address)
-    df["norm_country"] = df["country"].fillna("").map(normalize_country)
-    df["name_tokens"] = df["norm_name"].map(lambda x: tokenize_name(x, remove_stopwords=True))
-    df["address_tokens"] = df["norm_address"].map(tokenize_address)
-    df["name_first_token"] = df["norm_name"].map(name_first_token)
-    df["name_prefix3"] = df["norm_name"].map(lambda x: name_prefix(x, 3))
-    df["name_first_char"] = df["norm_name"].map(name_first_char)
+    n = len(df)
+    if verbose:
+        print(f"  preprocessing {n:,} rows...")
+
+    business_name = df["business_name"].fillna("")
+    business_address = df["business_address"].fillna("")
+    country = df["country"].fillna("")
+
+    df["norm_name"] = _map_via_unique(
+        business_name, normalize_name, "norm_name" if verbose else ""
+    )
+    df["norm_address"] = _map_via_unique(
+        business_address, normalize_address, "norm_address" if verbose else ""
+    )
+    df["norm_country"] = _map_via_unique(
+        country, normalize_country, "norm_country" if verbose else ""
+    )
+
+    df["name_tokens"] = _map_via_unique(
+        df["norm_name"],
+        lambda x: tokenize_name(x, remove_stopwords=True),
+        "name_tokens" if verbose else "",
+    )
+    df["address_tokens"] = _map_via_unique(
+        df["norm_address"], tokenize_address, "address_tokens" if verbose else ""
+    )
+    df["name_first_token"] = _map_via_unique(
+        df["norm_name"], name_first_token, "name_first_token" if verbose else ""
+    )
+    df["name_prefix3"] = _map_via_unique(
+        df["norm_name"], lambda x: name_prefix(x, 3), "name_prefix3" if verbose else ""
+    )
+    df["name_first_char"] = _map_via_unique(
+        df["norm_name"], name_first_char, "name_first_char" if verbose else ""
+    )
+
+    if verbose:
+        print(f"  done preprocessing {n:,} rows.")
     return df
