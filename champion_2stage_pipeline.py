@@ -40,18 +40,20 @@ def main():
 
     matching_path = os.path.join(output_dir, 'matching_results.tsv')
     candidate_path = os.path.join(output_dir, 'candidate_pairs.tsv')
-    model_path = 'output/champion_model_v2.pkl'
+    model_path = 'output/champion_model_v3.pkl'
 
     print("=" * 80, flush=True)
-    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v3)", flush=True)
+    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v4)", flush=True)
     print("=" * 80, flush=True)
 
-    # Load LightGBM v2 Model Bundle
+    # Load LightGBM v3 Model Bundle
     with open(model_path, 'rb') as f:
         bundle = pickle.load(f)
     clf = bundle['clf']
-    opt_thresh = bundle.get('threshold', 0.90)
-    print(f"Loaded LightGBM v2 Model (Opt Thresh: {opt_thresh:.2f}, Features: {clf.n_features_in_}).", flush=True)
+    t_prim = bundle.get('t_primary', 0.65)
+    t_sec = bundle.get('t_secondary', 0.75)
+    t_tert = bundle.get('t_tertiary', 0.82)
+    print(f"Loaded LightGBM v3 Model (T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f}, Features: {clf.n_features_in_}).", flush=True)
 
     # 1. Load S1 Records
     print("\n[1/5] Loading Test Source 1...", flush=True)
@@ -202,17 +204,18 @@ def main():
     chunk_pairs = []
     s1_model_matches = defaultdict(lambda: {'S2': list(), 'S3': list()})
 
-    T_PRIMARY = opt_thresh - 0.04
-    T_SECONDARY = opt_thresh - 0.02
-    T_TERTIARY = opt_thresh
+    T_PRIMARY = t_prim
+    T_SECONDARY = t_sec
+    T_TERTIARY = t_tert
 
     def score_chunk():
         if not chunk_features: return
         X = np.array(chunk_features, dtype=np.float32)
         probs = clf.predict_proba(X)[:, 1]
-        for (sid, cid, src), prob in zip(chunk_pairs, probs):
-            if prob >= T_PRIMARY:
-                s1_model_matches[sid][src].append((cid, prob))
+        for (sid, cid, src, exact_brand), prob in zip(chunk_pairs, probs):
+            min_t = 0.50 if exact_brand else T_PRIMARY
+            if prob >= min_t:
+                s1_model_matches[sid][src].append((cid, prob, exact_brand))
         chunk_features.clear()
         chunk_pairs.clear()
 
@@ -239,8 +242,9 @@ def main():
                 cn, csq, ca, csnum, cc = cand_data[cid]
                 c_nums = get_all_nums(ca)
                 c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
-                chunk_features.append(compute_pair_features(s1_tup, c_tup, score))
-                chunk_pairs.append((sid, cid, 'S2'))
+                exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
+                chunk_features.append(compute_pair_features(s1_tup, c_tup))
+                chunk_pairs.append((sid, cid, 'S2', exact_brand))
                 if len(chunk_features) >= CHUNK_SIZE:
                     pairs_scored += len(chunk_features)
                     score_chunk()
@@ -250,8 +254,9 @@ def main():
                 cn, csq, ca, csnum, cc = cand_data[cid]
                 c_nums = get_all_nums(ca)
                 c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
-                chunk_features.append(compute_pair_features(s1_tup, c_tup, score))
-                chunk_pairs.append((sid, cid, 'S3'))
+                exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
+                chunk_features.append(compute_pair_features(s1_tup, c_tup))
+                chunk_pairs.append((sid, cid, 'S3', exact_brand))
                 if len(chunk_features) >= CHUNK_SIZE:
                     pairs_scored += len(chunk_features)
                     score_chunk()
@@ -282,8 +287,8 @@ def main():
 
         # Allow up to 4 matches per source (up to 8 matches total)
         for src_ranked in [s2_ranked, s3_ranked]:
-            for rank, (cid, prob) in enumerate(src_ranked[:4]):
-                thresh = T_PRIMARY if rank == 0 else (T_SECONDARY if rank == 1 else T_TERTIARY)
+            for rank, (cid, prob, exact_brand) in enumerate(src_ranked[:4]):
+                thresh = (0.50 if exact_brand else T_PRIMARY) if rank == 0 else (T_SECONDARY if rank == 1 else T_TERTIARY)
                 if prob >= thresh:
                     raw_s1_matches[sid].append(cid)
                     cand_claims[cid].append((sid, prob))

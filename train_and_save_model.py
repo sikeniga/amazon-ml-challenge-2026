@@ -1,13 +1,13 @@
 """
 train_and_save_model.py
 =======================
-Trains the next-generation LightGBM matching model with:
+Trains the next-generation LightGBM matching model (v3) with:
   1. Multilingual AnyAscii normalization & domain/honorific stripping
-  2. 29 high-precision features with safe missing-address handling
+  2. 31 high-precision features without priority score bias/leak
   3. Memory-bounded candidate streaming (<1.5 GB peak RAM)
   4. Balanced hard negative mining + ground truth positive augmentation
-  5. F0.5 precision-weighted calibration (scale_pos_weight=3.0)
-  6. Validation threshold sweep targeting Macro F0.5
+  5. Calibrated scale_pos_weight=1.5 for honest posterior probabilities
+  6. Multi-tier validation sweep (T_PRIMARY, T_SECONDARY, T_TERTIARY) targeting Macro F0.5
 """
 
 import os
@@ -59,7 +59,7 @@ def build_record_tuple(name: str, addr: str, ctry: str):
 def main():
     t0 = time.time()
     print("=" * 75, flush=True)
-    print("  TRAINING HIGH-PRECISION MULTILINGUAL LIGHTGBM MODEL (v2)", flush=True)
+    print("  TRAINING HIGH-PRECISION MULTILINGUAL LIGHTGBM MODEL (v3)", flush=True)
     print("=" * 75, flush=True)
 
     N_TRAIN_S1 = 30_000
@@ -186,7 +186,6 @@ def main():
                         if len(w) >= 3 and (c, snum, w) in idx_addr_num_word:
                             for sid in idx_addr_num_word[(c, snum, w)]: sid_scores[sid] = max(sid_scores[sid], 60)
 
-                # Memory-bounded insertion: ONLY keep tuple if candidate actually made the top list or is ground truth
                 retained = False
                 for sid, score in sid_scores.items():
                     cur = s1_candidates[sid]
@@ -204,7 +203,6 @@ def main():
                 if retained or is_gt:
                     cand_tuples[cid] = build_record_tuple(bname, baddr, bctry)
 
-    # Augment ground-truth positive pairs
     print(f"      Total unique candidates retained in memory: {len(cand_tuples):,}", flush=True)
     augmented = 0
     for sid in target_s1_ids:
@@ -216,8 +214,8 @@ def main():
                     augmented += 1
     print(f"      Augmented {augmented:,} true matches into candidate sets.", flush=True)
 
-    # 4. Feature Extraction
-    print("\n[4/5] Extracting 29 features for Train and Validation splits...", flush=True)
+    # 4. Feature Extraction (31 Pure Features)
+    print("\n[4/5] Extracting 31 pure features for Train and Validation splits...", flush=True)
     X_train, y_train = [], []
     X_val, y_val = [], []
     val_pairs = []
@@ -232,7 +230,7 @@ def main():
         for cid, prio in cands.items():
             if cid not in cand_tuples: continue
             cand_tup = cand_tuples[cid]
-            feats = compute_pair_features(s1_tup, cand_tup, prio)
+            feats = compute_pair_features(s1_tup, cand_tup)
             label = 1 if cid in true_cids else 0
 
             if is_train:
@@ -253,58 +251,84 @@ def main():
     print(f"      Train Set: {len(X_train):,} pairs (Pos: {pos_tr:,}, Neg: {neg_tr:,})", flush=True)
     print(f"      Val Set  : {len(X_val):,} pairs (Pos: {pos_val:,}, Neg: {neg_val:,})", flush=True)
 
-    # 5. Fit Calibrated LightGBM Model
-    print("\n[5/5] Training LightGBM Model with F0.5 Calibration...", flush=True)
+    # 5. Fit Calibrated LightGBM Model v3
+    print("\n[5/5] Training LightGBM Model v3 (scale_pos_weight=1.5)...", flush=True)
     clf = lgb.LGBMClassifier(
-        n_estimators=450,
+        n_estimators=500,
         learning_rate=0.04,
-        num_leaves=45,
-        min_child_samples=40,
+        num_leaves=63,
+        min_child_samples=30,
         subsample=0.85,
         colsample_bytree=0.85,
-        scale_pos_weight=3.0,
+        scale_pos_weight=1.5,
         random_state=42,
         verbose=-1
     )
     clf.fit(X_train, y_train)
     print("      Model training complete.", flush=True)
 
-    # Sweep Threshold on Validation Set
-    print("\n  Sweeping decision threshold for peak Macro F0.5 on held-out validation set...", flush=True)
+    # Multi-Tier Validation Threshold Sweep
+    print("\n  Multi-Tier Threshold Sweep on held-out validation set...", flush=True)
     val_probs = clf.predict_proba(X_val)[:, 1]
 
-    best_thresh = 0.50
-    best_f05 = 0.0
+    val_ent_cands = defaultdict(list)
+    for (sid, cid), prob in zip(val_pairs, val_probs):
+        val_ent_cands[sid].append((cid, prob))
+    for sid in val_ent_cands:
+        val_ent_cands[sid].sort(key=lambda x: -x[1])
 
-    for thresh in np.arange(0.60, 0.94, 0.02):
-        thresh = round(thresh, 2)
-        preds = defaultdict(set)
-        for (sid, cid), prob in zip(val_pairs, val_probs):
-            if prob >= thresh:
-                preds[sid].add(cid)
-        score = macro_f05(preds, val_gt)
-        if score > best_f05:
-            best_f05 = score
-            best_thresh = thresh
-        print(f"    Thresh {thresh:.2f} -> Macro F0.5 = {score:.4f}", flush=True)
+    best_score = 0.0
+    best_t_prim = 0.60
+    best_t_sec = 0.75
+    best_t_tert = 0.85
 
-    print(f"\n>>> OPTIMAL THRESHOLD: {best_thresh:.2f} (Macro F0.5: {best_f05:.4f}) <<<", flush=True)
+    # Sweep primary from 0.45 to 0.85
+    for t_prim in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]:
+        for t_sec in [0.70, 0.75, 0.80, 0.85]:
+            if t_sec < t_prim: continue
+            for t_tert in [0.80, 0.85, 0.90]:
+                if t_tert < t_sec: continue
+                preds = defaultdict(set)
+                for sid in val_eids:
+                    cands = val_ent_cands.get(sid, [])
+                    for rank, (cid, p) in enumerate(cands[:4]):
+                        thresh = t_prim if rank == 0 else (t_sec if rank == 1 else t_tert)
+                        if p >= thresh:
+                            preds[sid].add(cid)
+
+                score = macro_f05(preds, val_gt)
+                if score > best_score:
+                    best_score = score
+                    best_t_prim = t_prim
+                    best_t_sec = t_sec
+                    best_t_tert = t_tert
+                    n_empty = sum(1 for sid in val_eids if len(preds.get(sid, set())) == 0)
+                    pct_empty = n_empty / len(val_eids) * 100.0
+                    print(f"    * NEW BEST * T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f} -> Macro F0.5 = {score:.4f} (Singletons: {pct_empty:.2f}%)", flush=True)
+
+    print(f"\n>>> OPTIMAL MULTI-TIER THRESHOLDS <<<", flush=True)
+    print(f"    T_PRIMARY   : {best_t_prim:.2f}", flush=True)
+    print(f"    T_SECONDARY : {best_t_sec:.2f}", flush=True)
+    print(f"    T_TERTIARY  : {best_t_tert:.2f}", flush=True)
+    print(f"    Validation Macro F0.5: {best_score:.4f}", flush=True)
 
     # Feature Importances
-    print("\n  Top Feature Importances:", flush=True)
+    print("\n  Top Feature Importances (v3):", flush=True)
     importances = clf.feature_importances_
     sorted_idx = np.argsort(importances)[::-1]
     for rank, idx in enumerate(sorted_idx[:15], 1):
         print(f"    {rank:2d}. {FEATURE_NAMES[idx]:<26} : {importances[idx]}", flush=True)
 
-    # Save Model Bundle
+    # Save Model Bundle v3
     output_dir = 'output'
     os.makedirs(output_dir, exist_ok=True)
-    bundle_path = os.path.join(output_dir, 'champion_model_v2.pkl')
+    bundle_path = os.path.join(output_dir, 'champion_model_v3.pkl')
     bundle = {
         'clf': clf,
-        'threshold': best_thresh,
-        'val_f05': best_f05,
+        't_primary': best_t_prim,
+        't_secondary': best_t_sec,
+        't_tertiary': best_t_tert,
+        'val_f05': best_score,
         'feature_names': FEATURE_NAMES
     }
     with open(bundle_path, 'wb') as f:
