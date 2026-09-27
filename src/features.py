@@ -1,147 +1,220 @@
-"""
-features.py
-===========
-Build the full pairwise feature matrix from candidate pairs.
+import re
+import unicodedata
+from rapidfuzz.distance import JaroWinkler, Levenshtein
+import rapidfuzz.fuzz as rfuzz
 
-Combines:
-  - Name similarity features   (from name_features.py)
-  - Address similarity features (from address_features.py)
-  - Country match flag
-  - Bulk TF-IDF cosines for names and addresses (computed here in batches)
+FEATURE_NAMES = [
+    # NAME FEATURES (1-14)
+    'name_exact',
+    'name_normalized_exact',
+    'name_length_difference',
+    'name_levenshtein_similarity',
+    'name_jaro_winkler_similarity',
+    'name_ratio',
+    'name_token_sort_ratio',
+    'name_token_set_ratio',
+    'name_char3_similarity',
+    'name_char4_similarity',
+    'name_char5_similarity',
+    'name_jaccard',
+    'first_token_similarity',
+    'last_token_similarity',
 
-This is the single entry point called by both train.py and inference.py.
-"""
+    # ADDRESS FEATURES (15-28)
+    'address_exact',
+    'address_length_difference',
+    'address_levenshtein_similarity',
+    'address_jaro_winkler_similarity',
+    'address_ratio',
+    'address_token_sort_ratio',
+    'address_token_set_ratio',
+    'address_char3_similarity',
+    'address_char4_similarity',
+    'address_char5_similarity',
+    'address_jaccard',
+    'house_number_match',
+    'postal_code_match',
+    'shared_number_count',
 
-import numpy as np
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
+    # COUNTRY (29)
+    'country_exact_match',
 
-from name_features import name_features
-from address_features import address_features
+    # CROSS FEATURES (30-37)
+    'cross_prod',
+    'cross_sum',
+    'cross_diff',
+    'cross_min',
+    'cross_max',
+    'high_name_high_address',
+    'high_name_missing_address',
+    'high_name_address_conflict',
 
+    # BLOCKING PRIO (38)
+    'prio_score'
+]
 
-# ---------------------------------------------------------------------------
-# Bulk paired TF-IDF cosine  (NOT full matrix — row-wise dot product)
-# ---------------------------------------------------------------------------
+def clean_name(s: str) -> str:
+    if not isinstance(s, str) or not s: return ''
+    s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
+    for sep in [' d/b/a ', ' dba ', ' t/a ', ' ta ', ' trading as ']:
+        if sep in s: s = s.split(sep)[-1]; break
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    s = re.sub(r'\b(inc|corp|corporation|incorporated|llc|pllc|ltd|limited|co|company|pvt|private|llp|pc|sarl|sas|sasu|sa|eurl|snc|sci|gie)\b', ' ', s)
+    return ' '.join(s.split())
 
-def _build_tfidf_lookup(
-    texts_a: list,
-    texts_b: list,
-    ngram_range: tuple = (2, 4),
-    analyzer: str = "char_wb",
+def squish(s: str) -> str:
+    s = re.sub(r'\b(com|org|net|in|fr|io|co|biz|info)\b', '', s)
+    return s.replace(' ', '')
+
+def clean_addr(s: str) -> str:
+    if not isinstance(s, str) or not s: return ''
+    s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    s = re.sub(r'\b(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|suite|ste|apt|floor|fl)\b', ' ', s)
+    return ' '.join(s.split())
+
+def get_street_num(addr: str) -> str:
+    if not isinstance(addr, str) or not addr: return ''
+    nums = re.findall(r'\b\d+\b', addr)
+    return nums[0] if nums else ''
+
+def get_postal_code(addr: str) -> str:
+    if not isinstance(addr, str) or not addr: return ''
+    postals = re.findall(r'\b\d{5}(?:-\d{4})?\b|\b[a-z]\d[a-z]\s?\d[a-z]\d\b', addr.lower())
+    return postals[0].replace(' ', '') if postals else ''
+
+def get_street_prefix(addr: str) -> str:
+    if not isinstance(addr, str) or not addr: return ''
+    ca = clean_name(addr)
+    words = [w for w in ca.split() if not w.isdigit() and len(w) >= 3]
+    return words[0][:3] if words else ''
+
+def _char_ngrams(s: str, n: int) -> set:
+    if len(s) < n: return {s} if s else set()
+    return {s[i:i+n] for i in range(len(s) - n + 1)}
+
+def _jaccard(set_a: set, set_b: set) -> float:
+    if not set_a and not set_b: return 1.0
+    if not set_a or not set_b: return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+def extract_pair_features(
+    s1_raw_name: str, s1_raw_addr: str, s1_ctry: str,
+    c_raw_name: str, c_raw_addr: str, c_ctry: str,
+    prio_score: float = 0.0
 ) -> list:
-    """
-    Given two equal-length aligned lists of strings,
-    return a list of cosine similarity scores (one per pair).
+    s1_n = clean_name(s1_raw_name)
+    cn = clean_name(c_raw_name)
+    s1_a = clean_addr(s1_raw_addr)
+    ca = clean_addr(c_raw_addr)
 
-    This is O(N) in pairs, not O(N^2), because we compute dot-products
-    row-by-row rather than building the full similarity matrix.
-    """
-    if not texts_a:
-        return []
+    s1_c = str(s1_ctry).upper().strip()
+    cc = str(c_ctry).upper().strip()
 
-    vectorizer = TfidfVectorizer(analyzer=analyzer, ngram_range=ngram_range, min_df=1)
-    vectorizer.fit(list(texts_a) + list(texts_b))
-    vecs_a = vectorizer.transform(texts_a)
-    vecs_b = vectorizer.transform(texts_b)
+    s1_w = s1_n.split()
+    cw = cn.split()
+    s1_aw = s1_a.split()
+    caw = ca.split()
 
-    cosines: list = []
-    batch = 1000
-    for i in range(0, len(texts_a), batch):
-        a_sl = vecs_a[i: i + batch]
-        b_sl = vecs_b[i: i + batch]
-        dot = np.array(a_sl.multiply(b_sl).sum(axis=1)).flatten()
-        norm_a = np.sqrt(np.array(a_sl.power(2).sum(axis=1)).flatten())
-        norm_b = np.sqrt(np.array(b_sl.power(2).sum(axis=1)).flatten())
-        denom = norm_a * norm_b
-        cos = np.where(denom > 0, dot / denom, 0.0)
-        cosines.extend(cos.tolist())
-    return cosines
+    # 1. NAME FEATURES
+    name_exact = float(s1_raw_name == c_raw_name and s1_raw_name != '')
+    name_normalized_exact = float(s1_n == cn and s1_n != '')
+    name_length_diff = float(abs(len(s1_n) - len(cn)))
+    
+    max_nl = max(len(s1_n), len(cn), 1)
+    name_lev = 1.0 - (Levenshtein.distance(s1_n, cn) / max_nl)
+    name_jw = JaroWinkler.similarity(s1_n, cn)
+    name_ratio = rfuzz.ratio(s1_n, cn) / 100.0
+    name_ts = rfuzz.token_sort_ratio(s1_n, cn) / 100.0
+    name_tset = rfuzz.token_set_ratio(s1_n, cn) / 100.0
 
+    name_char3 = _jaccard(_char_ngrams(s1_n, 3), _char_ngrams(cn, 3))
+    name_char4 = _jaccard(_char_ngrams(s1_n, 4), _char_ngrams(cn, 4))
+    name_char5 = _jaccard(_char_ngrams(s1_n, 5), _char_ngrams(cn, 5))
+    name_jaccard = _jaccard(set(s1_w), set(cw))
 
-# ---------------------------------------------------------------------------
-# Main feature builder
-# ---------------------------------------------------------------------------
+    first_tok_sim = JaroWinkler.similarity(s1_w[0], cw[0]) if (s1_w and cw) else 0.0
+    last_tok_sim = JaroWinkler.similarity(s1_w[-1], cw[-1]) if (s1_w and cw) else 0.0
 
-def build_feature_matrix(
-    pairs: list,          # list of (s1_entity_id, candidate_entity_id)
-    s1_df: pd.DataFrame,
-    cand_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Build a feature DataFrame for the given candidate pairs.
+    # 2. ADDRESS FEATURES
+    addr_exact = float(s1_raw_addr == c_raw_addr and s1_raw_addr != '')
+    addr_length_diff = float(abs(len(s1_a) - len(ca)))
+    
+    max_al = max(len(s1_a), len(ca), 1)
+    addr_lev = 1.0 - (Levenshtein.distance(s1_a, ca) / max_al) if (s1_a and ca) else 0.0
+    addr_jw = JaroWinkler.similarity(s1_a, ca) if (s1_a and ca) else 0.0
+    addr_ratio = (rfuzz.ratio(s1_a, ca) / 100.0) if (s1_a and ca) else 0.0
+    addr_ts = (rfuzz.token_sort_ratio(s1_a, ca) / 100.0) if (s1_a and ca) else 0.0
+    addr_tset = (rfuzz.token_set_ratio(s1_a, ca) / 100.0) if (s1_a and ca) else 0.0
 
-    Parameters
-    ----------
-    pairs    : list of (source1_entity_id, candidate_entity_id) tuples
-    s1_df    : preprocessed Source 1 DataFrame
-    cand_df  : preprocessed combined Source2+Source3 DataFrame
+    addr_char3 = _jaccard(_char_ngrams(s1_a, 3), _char_ngrams(ca, 3)) if (s1_a and ca) else 0.0
+    addr_char4 = _jaccard(_char_ngrams(s1_a, 4), _char_ngrams(ca, 4)) if (s1_a and ca) else 0.0
+    addr_char5 = _jaccard(_char_ngrams(s1_a, 5), _char_ngrams(ca, 5)) if (s1_a and ca) else 0.0
+    addr_jaccard = _jaccard(set(s1_aw), set(caw)) if (s1_aw and caw) else 0.0
 
-    Returns
-    -------
-    pd.DataFrame with columns:
-        source1_entity_id, candidate_entity_id, country_match,
-        name_*, address_*
-    """
-    if not pairs:
-        return pd.DataFrame()
+    s1_snum = get_street_num(s1_raw_addr)
+    csnum = get_street_num(c_raw_addr)
+    house_match = float(s1_snum == csnum and s1_snum != '')
 
-    s1_idx = s1_df.set_index("entity_id")
-    cand_idx = cand_df.set_index("entity_id")
+    s1_post = get_postal_code(s1_raw_addr)
+    cpost = get_postal_code(c_raw_addr)
+    postal_match = float(s1_post == cpost and s1_post != '')
 
-    s1_ids = [p[0] for p in pairs]
-    cand_ids = [p[1] for p in pairs]
+    s1_nums = set(re.findall(r'\b\d+\b', s1_raw_addr))
+    c_nums = set(re.findall(r'\b\d+\b', c_raw_addr))
+    shared_num_count = float(len(s1_nums & c_nums))
 
-    # Collect raw texts for bulk TF-IDF
-    s1_names = [
-        s1_idx.loc[i, "norm_name"] if i in s1_idx.index else "" for i in s1_ids
+    # 3. COUNTRY FEATURE
+    country_exact = float(s1_c == cc)
+
+    # 4. CROSS FEATURES
+    cross_prod = name_jw * addr_jw
+    cross_sum = name_jw + addr_jw
+    cross_diff = name_jw - addr_jw
+    cross_min = min(name_jw, addr_jw)
+    cross_max = max(name_jw, addr_jw)
+
+    high_name_high_addr = float(name_jw >= 0.85 and addr_jw >= 0.80)
+    high_name_missing_addr = float(name_jw >= 0.85 and (s1_a == '' or ca == ''))
+    high_name_addr_conflict = float(name_jw >= 0.85 and addr_jw < 0.40 and s1_a != '' and ca != '')
+
+    return [
+        name_exact,
+        name_normalized_exact,
+        name_length_diff,
+        name_lev,
+        name_jw,
+        name_ratio,
+        name_ts,
+        name_tset,
+        name_char3,
+        name_char4,
+        name_char5,
+        name_jaccard,
+        first_tok_sim,
+        last_tok_sim,
+        addr_exact,
+        addr_length_diff,
+        addr_lev,
+        addr_jw,
+        addr_ratio,
+        addr_ts,
+        addr_tset,
+        addr_char3,
+        addr_char4,
+        addr_char5,
+        addr_jaccard,
+        house_match,
+        postal_match,
+        shared_num_count,
+        country_exact,
+        cross_prod,
+        cross_sum,
+        cross_diff,
+        cross_min,
+        cross_max,
+        high_name_high_addr,
+        high_name_missing_addr,
+        high_name_addr_conflict,
+        float(prio_score)
     ]
-    cand_names = [
-        cand_idx.loc[i, "norm_name"] if i in cand_idx.index else "" for i in cand_ids
-    ]
-    s1_addrs = [
-        s1_idx.loc[i, "norm_address"] if i in s1_idx.index else "" for i in s1_ids
-    ]
-    cand_addrs = [
-        cand_idx.loc[i, "norm_address"] if i in cand_idx.index else "" for i in cand_ids
-    ]
-
-    print(f"  Computing TF-IDF cosines for {len(pairs):,} pairs (names)...")
-    name_cosines = _build_tfidf_lookup(s1_names, cand_names)
-
-    print(f"  Computing TF-IDF cosines for {len(pairs):,} pairs (addresses)...")
-    addr_cosines = _build_tfidf_lookup(s1_addrs, cand_addrs)
-
-    rows = []
-    for idx, (s1_id, cand_id) in enumerate(pairs):
-        if s1_id not in s1_idx.index or cand_id not in cand_idx.index:
-            continue
-
-        r1 = s1_idx.loc[s1_id]
-        rc = cand_idx.loc[cand_id]
-
-        n_feats = name_features(
-            r1["norm_name"],
-            rc["norm_name"],
-            list(r1["name_tokens"]),
-            list(rc["name_tokens"]),
-            tfidf_cosine=name_cosines[idx],
-        )
-        a_feats = address_features(
-            r1["norm_address"],
-            rc["norm_address"],
-            list(r1["address_tokens"]),
-            list(rc["address_tokens"]),
-            tfidf_cosine=addr_cosines[idx],
-        )
-
-        row = {
-            "source1_entity_id": s1_id,
-            "candidate_entity_id": cand_id,
-            "country_match": int(r1["norm_country"] == rc["norm_country"]),
-        }
-        row.update(n_feats)
-        row.update(a_feats)
-        rows.append(row)
-
-    return pd.DataFrame(rows)

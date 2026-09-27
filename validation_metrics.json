@@ -1,0 +1,15 @@
+{
+  "blocking_pair_recall": 0.6845643418040624,
+  "entity_coverage": 0.8706,
+  "candidate_count": 404740,
+  "candidate_precision": 0.05837080594949844,
+  "pair_precision": 0.9188072171362546,
+  "pair_recall": 0.5990843499174177,
+  "macro_f05": 0.7184515303111055,
+  "number_of_singletons": 557,
+  "number_of_predicted_singletons": 1734,
+  "false_positive_count": 1827,
+  "false_negative_count": 13836,
+  "false_match_on_singletons": 157,
+  "correctly_rejected_singletons": 400
+}

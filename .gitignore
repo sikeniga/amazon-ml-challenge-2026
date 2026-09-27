@@ -3,6 +3,7 @@ data/
 dataset/
 *.tsv
 *.csv
+!experiments.csv
 *.zip
 *.tar.gz
 
