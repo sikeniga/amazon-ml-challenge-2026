@@ -1,19 +1,27 @@
 """
 champion_2stage_pipeline.py
 ===========================
-High-Performance, Memory-Bounded 2-Stage Entity Resolution Pipeline (v3)
+High-Performance, Memory-Bounded 2-Stage Entity Resolution Pipeline (v5)
 Designed for Amazon ML Challenge 2026.
 
 Key architectural features:
-  1. Multilingual Normalization (Indic AnyAscii, domain/honorific stripping, French/Indian expansions)
-  2. Multi-tier Inverted Index Blocking with prune thresholds
-  3. Dynamic candidate retention (bounded to needed IDs, <1.8 GB RAM peak)
-  4. 29 High-Precision Features with safe missing-address indicators
-  5. Champion LightGBM v2 model (Macro F0.5 = 0.9621)
-  6. Real-time progress updates with speed and ETA
-  7. 1-to-1 Injective Disambiguation (0 duplicate candidates)
-  8. Streaming file export (no giant in-memory string lists)
-  9. Official submission validation with utils/validate_submission.py
+  1. Multilingual Multi-Pass Inverted Index Blocking:
+     - Exact name, squished slug, sorted token frequency pairs
+     - Distinctive brand tokens (>= 5 chars, non-generic)
+     - Postal/PIN + name prefix, City/State + name prefix
+     - Street number + street prefix, Street number + name word
+     - Pruned at maximum block sizes (350 multi-token, 60 brand)
+  2. Candidate retention capped at MAX_CANDS=16 per source (up to 32 cands/entity)
+  3. 43 pairwise features (RapidFuzz edit similarities, containment, structured location, interaction features)
+  4. Champion LightGBM v5 Model (Macro F0.5 = 0.9358 on 6k held-out validation)
+  5. Calibrated Multi-Match Thresholds:
+     - T_PRIMARY = 0.60 (0.52 for exact clean brand)
+     - T_SECONDARY = 0.75
+     - Hard conflict guardrail (prob >= 0.88 if PIN/street conflict)
+     - Up to 4 matches total per entity (targeting ~3.3–3.6M total matches)
+  6. Global 1-to-1 Disambiguation (0 duplicate candidates across S1 entities)
+  7. Direct streaming disk export (0 RAM overhead)
+  8. Official submission validation with utils/validate_submission.py
 """
 
 import os
@@ -29,8 +37,25 @@ import pandas as pd
 from rapidfuzz.distance import JaroWinkler
 import rapidfuzz.fuzz as rfuzz
 
-from src.preprocessing import clean_name, squish, clean_addr, get_street_num, get_all_nums, get_street_prefix
+from src.preprocessing import (
+    clean_name, squish, clean_addr, get_street_num, get_all_nums,
+    get_street_prefix, extract_structured, char_ngrams, get_distinctive_tokens,
+    GENERIC_WORDS
+)
 from src.features import compute_pair_features, FEATURE_NAMES
+
+def build_record_tuple(name: str, addr: str, ctry: str):
+    c = str(ctry).upper().strip()
+    cn = clean_name(name)
+    sq = squish(cn)
+    ca = clean_addr(addr, c)
+    snum = get_street_num(addr)
+    all_nums = get_all_nums(addr)
+    words = cn.split()
+    awords = ca.split()
+    pin, state, city = extract_structured(addr, c)
+    ngrams = char_ngrams(cn, 3)
+    return (cn, sq, ca, snum, c, all_nums, words, awords, pin, state, city, ngrams)
 
 def main():
     t0 = time.time()
@@ -40,20 +65,19 @@ def main():
 
     matching_path = os.path.join(output_dir, 'matching_results.tsv')
     candidate_path = os.path.join(output_dir, 'candidate_pairs.tsv')
-    model_path = 'output/champion_model_v4.pkl'
+    model_path = 'output/champion_model_v5.pkl'
 
     print("=" * 80, flush=True)
-    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v5)", flush=True)
+    print("  AMAZON ML CHALLENGE 2026 - PRODUCTION RESOLUTION PIPELINE (v5)", flush=True)
     print("=" * 80, flush=True)
 
-    # Load LightGBM v4 Model Bundle
+    # Load LightGBM v5 Model Bundle
     with open(model_path, 'rb') as f:
         bundle = pickle.load(f)
     clf = bundle['clf']
-    t_prim = bundle.get('t_primary', 0.78)
-    t_sec = bundle.get('t_secondary', 0.86)
-    t_tert = bundle.get('t_tertiary', 0.90)
-    print(f"Loaded LightGBM v4 Model (T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f}, Features: {clf.n_features_in_}).", flush=True)
+    t_prim = bundle.get('t_primary', 0.60)
+    t_sec = bundle.get('t_secondary', 0.75)
+    print(f"Loaded LightGBM v5 Model (T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, Features: {clf.n_features_in_}).", flush=True)
 
     # 1. Load S1 Records
     print("\n[1/5] Loading Test Source 1...", flush=True)
@@ -76,22 +100,19 @@ def main():
     idx_w12 = defaultdict(list)
     idx_fl = defaultdict(list)
     idx_w23 = defaultdict(list)
+    idx_brand = defaultdict(list)
     idx_addr_num_st = defaultdict(list)
     idx_addr_num_word = defaultdict(list)
+    idx_pin_w = defaultdict(list)
+    idx_city_w = defaultdict(list)
 
-    print("\n[2/5] Building Multilingual Inverted Index...", flush=True)
+    print("\n[2/5] Building Multilingual Multi-Pass Inverted Index...", flush=True)
     t_idx = time.time()
     for sid, bname, baddr, bctry in zip(s1_eids, s1_names_raw, s1_addrs_raw, s1_ctrys_raw):
-        c = str(bctry).upper().strip()
-        cn = clean_name(bname)
-        sq = squish(cn)
-        ca = clean_addr(baddr, c)
-        snum = get_street_num(baddr)
-        words = cn.split()
+        tup = build_record_tuple(bname, baddr, bctry)
+        cn, sq, ca, snum, c, all_nums, words, awords, pin, state, city, ngrams = tup
+        s1_data[sid] = tup
         st_pref = get_street_prefix(baddr)
-
-        # Compact representation in memory (5 simple strings)
-        s1_data[sid] = (cn, sq, ca, snum, c)
 
         if cn: idx_exact[(c, cn)].append(sid)
         if len(sq) >= 4: idx_sq[(c, sq)].append(sid)
@@ -99,26 +120,39 @@ def main():
         if len(words) >= 2 and len(words[0]) >= 3 and len(words[1]) >= 3: idx_w12[(c, words[0], words[1])].append(sid)
         if len(words) >= 2 and len(words[0]) >= 3 and len(words[-1]) >= 3: idx_fl[(c, words[0], words[-1])].append(sid)
         if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3: idx_w23[(c, words[1], words[-1])].append(sid)
+
+        for w in words:
+            if len(w) >= 5 and w not in GENERIC_WORDS:
+                idx_brand[(c, w)].append(sid)
+
         if snum and st_pref: idx_addr_num_st[(c, snum, st_pref)].append(sid)
         if snum:
             for w in words[:2]:
                 if len(w) >= 3: idx_addr_num_word[(c, snum, w)].append(sid)
 
+        if pin and words and len(words[0]) >= 3:
+            idx_pin_w[(c, pin, words[0][:4])].append(sid)
+        if city and words and len(words[0]) >= 3:
+            idx_city_w[(c, city, words[0][:4])].append(sid)
+
     # Prune overgrown keys for speed & precision
-    idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 120}
-    idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 120}
-    idx_tfp = {k: v for k, v in idx_tfp.items() if len(v) <= 120}
-    idx_w12 = {k: v for k, v in idx_w12.items() if len(v) <= 120}
-    idx_fl = {k: v for k, v in idx_fl.items() if len(v) <= 120}
-    idx_w23 = {k: v for k, v in idx_w23.items() if len(v) <= 120}
-    idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 40}
-    idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 40}
+    idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 350}
+    idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 350}
+    idx_tfp = {k: v for k, v in idx_tfp.items() if len(v) <= 350}
+    idx_w12 = {k: v for k, v in idx_w12.items() if len(v) <= 350}
+    idx_fl = {k: v for k, v in idx_fl.items() if len(v) <= 350}
+    idx_w23 = {k: v for k, v in idx_w23.items() if len(v) <= 350}
+    idx_brand = {k: v for k, v in idx_brand.items() if len(v) <= 60}
+    idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 80}
+    idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 80}
+    idx_pin_w = {k: v for k, v in idx_pin_w.items() if len(v) <= 150}
+    idx_city_w = {k: v for k, v in idx_city_w.items() if len(v) <= 100}
 
     print(f"      Indexed {n_s1:,} entities in {time.time()-t_idx:.1f}s.", flush=True)
 
     # 3. Stream Sources 2 & 3 with Memory-Bounded Retention
     print("\n[3/5] Streaming Sources 2 & 3 with Memory-Bounded Retention...", flush=True)
-    MAX_CANDS = 8
+    MAX_CANDS = 16
     cand_data = {}
     s2_candidates = defaultdict(dict)
     s3_candidates = defaultdict(dict)
@@ -160,12 +194,15 @@ def main():
                     for sid in idx_fl[(c, words[0], words[-1])]: sid_scores[sid] = max(sid_scores[sid], 75)
                 if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3 and (c, words[1], words[-1]) in idx_w23:
                     for sid in idx_w23[(c, words[1], words[-1])]: sid_scores[sid] = max(sid_scores[sid], 70)
+                for w in words:
+                    if len(w) >= 5 and (c, w) in idx_brand:
+                        for sid in idx_brand[(c, w)]: sid_scores[sid] = max(sid_scores[sid], 65)
                 if snum and st_pref and (c, snum, st_pref) in idx_addr_num_st:
-                    for sid in idx_addr_num_st[(c, snum, st_pref)]: sid_scores[sid] = max(sid_scores[sid], 65)
+                    for sid in idx_addr_num_st[(c, snum, st_pref)]: sid_scores[sid] = max(sid_scores[sid], 60)
                 if snum:
                     for w in words[:2]:
                         if len(w) >= 3 and (c, snum, w) in idx_addr_num_word:
-                            for sid in idx_addr_num_word[(c, snum, w)]: sid_scores[sid] = max(sid_scores[sid], 60)
+                            for sid in idx_addr_num_word[(c, snum, w)]: sid_scores[sid] = max(sid_scores[sid], 55)
 
                 retained = False
                 for sid, score in sid_scores.items():
@@ -181,8 +218,7 @@ def main():
                             retained = True
 
                 if retained:
-                    ca = clean_addr(baddr, c)
-                    cand_data[cid] = (cn, sq, ca, snum, c)
+                    cand_data[cid] = build_record_tuple(bname, baddr, bctry)
 
             print(f"         Processed {n_rows:,} records in {time.time()-t_f:.1f}s...", end='\r', flush=True)
         print(f"\n         {filename} complete ({n_rows:,} records in {time.time()-t_f:.1f}s).", flush=True)
@@ -195,7 +231,7 @@ def main():
     cand_data = {cid: cand_data[cid] for cid in needed_cids if cid in cand_data}
     print(f"      Active unique candidates retained: {len(cand_data):,}. Streaming time: {(time.time()-t_stream)/60:.1f}m", flush=True)
 
-    # 4. Fast Vectorized Scoring with Live Progress Updates
+    # 4. Fast Vectorized Scoring
     print("\n[4/5] Scoring Candidate Pairs with Real-Time Progress...", flush=True)
     t_score = time.time()
     s1_all_cands = {}
@@ -206,29 +242,24 @@ def main():
 
     T_PRIMARY = t_prim
     T_SECONDARY = t_sec
-    T_TERTIARY = t_tert
 
     def score_chunk():
         if not chunk_features: return
         X = np.array(chunk_features, dtype=np.float32)
         probs = clf.predict_proba(X)[:, 1]
-        for (sid, cid, src, exact_brand), prob in zip(chunk_pairs, probs):
-            min_t = (T_PRIMARY - 0.05) if exact_brand else T_PRIMARY
+        for (sid, cid, src, exact_brand, has_conflict), prob in zip(chunk_pairs, probs):
+            min_t = 0.88 if has_conflict else ((T_PRIMARY - 0.08) if exact_brand else T_PRIMARY)
             if prob >= min_t:
-                s1_model_matches[sid][src].append((cid, prob, exact_brand))
+                s1_model_matches[sid][src].append((cid, prob, exact_brand, has_conflict))
         chunk_features.clear()
         chunk_pairs.clear()
 
     total_candidate_pairs = 0
     pairs_scored = 0
-    t_last_log = time.time()
 
     for idx, sid in enumerate(s1_eids, 1):
-        s1_n, s1_sq, s1_a, s1_snum, s1_c = s1_data[sid]
-        s1_nums = get_all_nums(s1_a)
-        s1_words = s1_n.split()
-        s1_awords = s1_a.split()
-        s1_tup = (s1_n, s1_sq, s1_a, s1_snum, s1_c, s1_nums, s1_words, s1_awords)
+        s1_tup = s1_data[sid]
+        s1_n, s1_sq, s1_a, s1_snum, s1_c, s1_nums, s1_w, s1_aw, s1_pin, s1_state, s1_city, s1_ng = s1_tup
 
         s2_dict = s2_candidates.get(sid, {})
         s3_dict = s3_candidates.get(sid, {})
@@ -237,26 +268,26 @@ def main():
         s1_all_cands[sid] = all_cands_list
         total_candidate_pairs += len(all_cands_list)
 
-        for cid, score in s2_dict.items():
+        for cid in s2_dict:
             if cid in cand_data:
-                cn, csq, ca, csnum, cc = cand_data[cid]
-                c_nums = get_all_nums(ca)
-                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
+                c_tup = cand_data[cid]
+                cn, csq, ca, csnum, cc, c_nums, cw, caw, c_pin, c_state, c_city, c_ng = c_tup
                 exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
+                has_conflict = bool((s1_snum and csnum and s1_snum != csnum) or (s1_pin and c_pin and s1_pin != c_pin))
                 chunk_features.append(compute_pair_features(s1_tup, c_tup))
-                chunk_pairs.append((sid, cid, 'S2', exact_brand))
+                chunk_pairs.append((sid, cid, 'S2', exact_brand, has_conflict))
                 if len(chunk_features) >= CHUNK_SIZE:
                     pairs_scored += len(chunk_features)
                     score_chunk()
 
-        for cid, score in s3_dict.items():
+        for cid in s3_dict:
             if cid in cand_data:
-                cn, csq, ca, csnum, cc = cand_data[cid]
-                c_nums = get_all_nums(ca)
-                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
+                c_tup = cand_data[cid]
+                cn, csq, ca, csnum, cc, c_nums, cw, caw, c_pin, c_state, c_city, c_ng = c_tup
                 exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
+                has_conflict = bool((s1_snum and csnum and s1_snum != csnum) or (s1_pin and c_pin and s1_pin != c_pin))
                 chunk_features.append(compute_pair_features(s1_tup, c_tup))
-                chunk_pairs.append((sid, cid, 'S3', exact_brand))
+                chunk_pairs.append((sid, cid, 'S3', exact_brand, has_conflict))
                 if len(chunk_features) >= CHUNK_SIZE:
                     pairs_scored += len(chunk_features)
                     score_chunk()
@@ -272,12 +303,11 @@ def main():
     score_chunk()
     print(f"      Scoring complete! Total pairs scored: {total_candidate_pairs:,} in {(time.time()-t_score)/60:.1f} min.", flush=True)
 
-    # Free up candidates dictionary
     del s2_candidates
     del s3_candidates
 
-    # 5. Multi-Match Selection & 1-to-1 Disambiguation (98% Precision Guardrail)
-    print("\n[5/5] Multi-Match Selection & Global 1-to-1 Disambiguation (98% Precision Guardrail)...", flush=True)
+    # 5. Multi-Match Selection & Global 1-to-1 Disambiguation
+    print("\n[5/5] Multi-Match Selection & Global 1-to-1 Disambiguation...", flush=True)
     raw_s1_matches = defaultdict(list)
     cand_claims = defaultdict(list)
 
@@ -285,23 +315,28 @@ def main():
         s2_ranked = sorted(s1_model_matches[sid]['S2'], key=lambda x: -x[1])
         s3_ranked = sorted(s1_model_matches[sid]['S3'], key=lambda x: -x[1])
 
-        # Precision Guardrail: at most 2 matches from S2 and at most 2 from S3, maximum 3 matches total
+        # Balanced Multi-Match: at most 2 from S2 and at most 2 from S3, maximum 4 matches total
         ent_matches = []
         for src_ranked in [s2_ranked, s3_ranked]:
-            for rank, (cid, prob, exact_brand) in enumerate(src_ranked[:2]):
-                thresh = (T_PRIMARY - 0.05 if exact_brand else T_PRIMARY) if rank == 0 else T_SECONDARY
+            for rank, (cid, prob, exact_brand, has_conflict) in enumerate(src_ranked[:3]):
+                if has_conflict:
+                    thresh = 0.88
+                elif rank == 0:
+                    thresh = (T_PRIMARY - 0.08) if exact_brand else T_PRIMARY
+                else:
+                    thresh = T_SECONDARY
+
                 if prob >= thresh:
                     ent_matches.append((cid, prob))
 
-        # Sort all accepted candidates by probability descending and keep at most 3
         ent_matches.sort(key=lambda x: -x[1])
-        for cid, prob in ent_matches[:3]:
+        for cid, prob in ent_matches[:4]:
             raw_s1_matches[sid].append(cid)
             cand_claims[cid].append((sid, prob))
 
     del s1_model_matches
 
-    # Global 1-to-1 Disambiguation
+    # Global 1-to-1 Disambiguation (Winner Resolution)
     cand_winner = {}
     for cid, claims in cand_claims.items():
         if len(claims) == 1:
@@ -309,13 +344,16 @@ def main():
         else:
             best_sid = None
             best_score = -9999.0
-            cn, _, ca, csnum, _ = cand_data[cid]
+            cn, _, ca, csnum, _, _, _, _, c_pin, _, _, _ = cand_data[cid]
             for sid, prob in claims:
-                s1_n, _, s1_a, s1_snum, _ = s1_data[sid]
+                s1_n, _, s1_a, s1_snum, _, _, _, _, s1_pin, _, _, _ = s1_data[sid]
                 score = prob * 100.0 + rfuzz.token_set_ratio(s1_a, ca) * 0.5 + rfuzz.token_set_ratio(s1_n, cn) * 0.2
                 if s1_snum and csnum:
                     if s1_snum == csnum: score += 30.0
                     else: score -= 50.0
+                if s1_pin and c_pin:
+                    if s1_pin == c_pin: score += 20.0
+                    else: score -= 30.0
                 if score > best_score:
                     best_score = score
                     best_sid = sid
@@ -379,7 +417,7 @@ def main():
         print(f"    -> Exported: {dst}", flush=True)
 
     print(f"\n  Total pipeline time: {(time.time()-t0)/60:.1f} minutes", flush=True)
-    print("  SUCCESS! New v3 submission file is ready for leaderboard upload!", flush=True)
+    print("  SUCCESS! New v5 submission file is ready for leaderboard upload!", flush=True)
 
 if __name__ == '__main__':
     main()

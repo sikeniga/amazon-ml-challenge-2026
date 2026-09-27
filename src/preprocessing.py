@@ -174,3 +174,82 @@ def get_distinctive_address_tokens(addr: str, country: str = '') -> list:
     ca = clean_addr(addr, country)
     words = [w for w in ca.split() if not w.isdigit() and len(w) >= 4]
     return words[-4:] if len(words) >= 4 else words
+
+
+GENERIC_WORDS = {
+    'group', 'company', 'enterprises', 'enterprise', 'services', 'service',
+    'solutions', 'solution', 'technologies', 'technology', 'consulting',
+    'industries', 'industry', 'associates', 'trading', 'international',
+    'management', 'center', 'centre', 'hospital', 'clinic', 'store',
+    'shops', 'india', 'agency', 'commercial', 'holdings', 'corporation',
+    'limited', 'private', 'national', 'global', 'general', 'medical',
+    'retail', 'business', 'system', 'systems', 'health', 'care'
+}
+
+US_STATES = {
+    'al', 'ak', 'az', 'ar', 'ca', 'co', 'ct', 'de', 'fl', 'ga', 'hi', 'id', 'il', 'in', 'ia', 'ks', 'ky',
+    'la', 'me', 'md', 'ma', 'mi', 'mn', 'ms', 'mo', 'mt', 'ne', 'nv', 'nh', 'nj', 'nm', 'ny', 'nc', 'nd',
+    'oh', 'ok', 'or', 'pa', 'ri', 'sc', 'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy'
+}
+
+def extract_structured(addr: str, country: str = '') -> tuple:
+    """
+    Extract structured attributes: (pin, state, city)
+    """
+    if not isinstance(addr, str) or not addr:
+        return ('', '', '')
+    c = str(country).upper().strip()
+    
+    # 1. PIN / ZIP code
+    pin = ''
+    if c == 'INDIA':
+        m = re.findall(r'\b[1-9]\d{5}\b', addr)
+        if m: pin = m[-1]
+    elif c in ('US', 'FRANCE'):
+        m = re.findall(r'\b\d{5}\b', addr)
+        if m: pin = m[-1]
+        
+    # 2. State & City
+    state = ''
+    city = ''
+    ca = clean_addr(addr, c)
+    words = ca.split()
+    
+    if c == 'US':
+        raw_tokens = re.findall(r'\b[A-Za-z]{2}\b', addr.lower())
+        for tok in raw_tokens:
+            if tok in US_STATES:
+                state = tok
+                break
+        if len(words) >= 2:
+            city = words[-2] if words[-1] == state else words[-1]
+        elif len(words) == 1:
+            city = words[0]
+    elif c == 'INDIA':
+        for pat, norm in INDIAN_STATE_SYNONYMS.items():
+            if re.search(pat, addr, re.IGNORECASE):
+                state = norm
+                break
+        if len(words) >= 1:
+            city = words[-1]
+    elif c == 'FRANCE':
+        if len(words) >= 2:
+            city = words[-2]
+            state = words[-1]
+        elif len(words) == 1:
+            city = words[0]
+            
+    return (pin, state, city)
+
+
+def char_ngrams(s: str, n: int = 3) -> set:
+    """Return set of character n-grams from string."""
+    if not s or len(s) < n:
+        return {s} if s else set()
+    return {s[i:i+n] for i in range(len(s) - n + 1)}
+
+
+def get_distinctive_tokens(name: str) -> list:
+    """Extract distinctive brand tokens >= 5 characters, filtering out common corporate words."""
+    words = clean_name(name).split()
+    return [w for w in words if len(w) >= 5 and w not in GENERIC_WORDS]
