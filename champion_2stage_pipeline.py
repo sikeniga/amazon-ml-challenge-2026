@@ -8,11 +8,13 @@ Key architectural features:
   1. Multilingual Multi-Pass Inverted Index Blocking:
      - Exact name, squished slug, sorted token frequency pairs
      - Distinctive brand tokens (>= 5 chars, non-generic)
-     - Postal/PIN + name prefix, City/State + name prefix
      - Street number + street prefix, Street number + name word
      - Pruned at maximum block sizes (350 multi-token, 60 brand)
-  2. Candidate retention capped at MAX_CANDS=16 per source (up to 32 cands/entity)
-  3. 43 pairwise features (RapidFuzz edit similarities, containment, structured location, interaction features)
+  2. Memory-bounded candidate retention:
+     - MAX_CANDS=10 per source (retaining up to 20 candidates per entity)
+     - Stored as 5 compact primitive strings (<2.2 GB peak RAM)
+  3. 43 pairwise features computed on-the-fly:
+     - RapidFuzz edit similarities, containment, structured location, interaction features
   4. Champion LightGBM v5 Model (Macro F0.5 = 0.9358 on 6k held-out validation)
   5. Calibrated Multi-Match Thresholds:
      - T_PRIMARY = 0.60 (0.52 for exact clean brand)
@@ -43,19 +45,6 @@ from src.preprocessing import (
     GENERIC_WORDS
 )
 from src.features import compute_pair_features, FEATURE_NAMES
-
-def build_record_tuple(name: str, addr: str, ctry: str):
-    c = str(ctry).upper().strip()
-    cn = clean_name(name)
-    sq = squish(cn)
-    ca = clean_addr(addr, c)
-    snum = get_street_num(addr)
-    all_nums = get_all_nums(addr)
-    words = cn.split()
-    awords = ca.split()
-    pin, state, city = extract_structured(addr, c)
-    ngrams = char_ngrams(cn, 3)
-    return (cn, sq, ca, snum, c, all_nums, words, awords, pin, state, city, ngrams)
 
 def main():
     t0 = time.time()
@@ -103,16 +92,20 @@ def main():
     idx_brand = defaultdict(list)
     idx_addr_num_st = defaultdict(list)
     idx_addr_num_word = defaultdict(list)
-    idx_pin_w = defaultdict(list)
-    idx_city_w = defaultdict(list)
 
     print("\n[2/5] Building Multilingual Multi-Pass Inverted Index...", flush=True)
     t_idx = time.time()
     for sid, bname, baddr, bctry in zip(s1_eids, s1_names_raw, s1_addrs_raw, s1_ctrys_raw):
-        tup = build_record_tuple(bname, baddr, bctry)
-        cn, sq, ca, snum, c, all_nums, words, awords, pin, state, city, ngrams = tup
-        s1_data[sid] = tup
+        c = str(bctry).upper().strip()
+        cn = clean_name(bname)
+        sq = squish(cn)
+        ca = clean_addr(baddr, c)
+        snum = get_street_num(baddr)
+        words = cn.split()
         st_pref = get_street_prefix(baddr)
+
+        # Compact 5-string representation in memory (~120 MB RAM)
+        s1_data[sid] = (cn, sq, ca, snum, c)
 
         if cn: idx_exact[(c, cn)].append(sid)
         if len(sq) >= 4: idx_sq[(c, sq)].append(sid)
@@ -130,11 +123,6 @@ def main():
             for w in words[:2]:
                 if len(w) >= 3: idx_addr_num_word[(c, snum, w)].append(sid)
 
-        if pin and words and len(words[0]) >= 3:
-            idx_pin_w[(c, pin, words[0][:4])].append(sid)
-        if city and words and len(words[0]) >= 3:
-            idx_city_w[(c, city, words[0][:4])].append(sid)
-
     # Prune overgrown keys for speed & precision
     idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 350}
     idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 350}
@@ -145,14 +133,12 @@ def main():
     idx_brand = {k: v for k, v in idx_brand.items() if len(v) <= 60}
     idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 80}
     idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 80}
-    idx_pin_w = {k: v for k, v in idx_pin_w.items() if len(v) <= 150}
-    idx_city_w = {k: v for k, v in idx_city_w.items() if len(v) <= 100}
 
     print(f"      Indexed {n_s1:,} entities in {time.time()-t_idx:.1f}s.", flush=True)
 
-    # 3. Stream Sources 2 & 3 with Memory-Bounded Retention
-    print("\n[3/5] Streaming Sources 2 & 3 with Memory-Bounded Retention...", flush=True)
-    MAX_CANDS = 16
+    # 3. Stream Sources 2 & 3 with Memory-Bounded Retention (<2.2 GB RAM)
+    print("\n[3/5] Streaming Sources 2 & 3 with Memory-Bounded Retention (<2.2 GB RAM)...", flush=True)
+    MAX_CANDS = 10
     cand_data = {}
     s2_candidates = defaultdict(dict)
     s3_candidates = defaultdict(dict)
@@ -218,10 +204,12 @@ def main():
                             retained = True
 
                 if retained:
-                    cand_data[cid] = build_record_tuple(bname, baddr, bctry)
+                    ca = clean_addr(baddr, c)
+                    cand_data[cid] = (cn, sq, ca, snum, c)
 
-            print(f"         Processed {n_rows:,} records in {time.time()-t_f:.1f}s...", end='\r', flush=True)
-        print(f"\n         {filename} complete ({n_rows:,} records in {time.time()-t_f:.1f}s).", flush=True)
+            rate = n_rows / max(time.time() - t_f, 0.1)
+            print(f"         Processed {n_rows:,} records ({rate:,.0f} rec/s, elapsed: {time.time()-t_f:.1f}s)...", flush=True)
+        print(f"         {filename} complete ({n_rows:,} records in {time.time()-t_f:.1f}s).", flush=True)
 
     # Purge orphan candidates to free RAM
     print("      Purging non-retained candidates from memory...", flush=True)
@@ -231,7 +219,7 @@ def main():
     cand_data = {cid: cand_data[cid] for cid in needed_cids if cid in cand_data}
     print(f"      Active unique candidates retained: {len(cand_data):,}. Streaming time: {(time.time()-t_stream)/60:.1f}m", flush=True)
 
-    # 4. Fast Vectorized Scoring
+    # 4. Fast Vectorized Scoring with On-The-Fly Features
     print("\n[4/5] Scoring Candidate Pairs with Real-Time Progress...", flush=True)
     t_score = time.time()
     s1_all_cands = {}
@@ -258,8 +246,13 @@ def main():
     pairs_scored = 0
 
     for idx, sid in enumerate(s1_eids, 1):
-        s1_tup = s1_data[sid]
-        s1_n, s1_sq, s1_a, s1_snum, s1_c, s1_nums, s1_w, s1_aw, s1_pin, s1_state, s1_city, s1_ng = s1_tup
+        s1_n, s1_sq, s1_a, s1_snum, s1_c = s1_data[sid]
+        s1_nums = get_all_nums(s1_a)
+        s1_words = s1_n.split()
+        s1_awords = s1_a.split()
+        s1_pin, s1_state, s1_city = extract_structured(s1_a, s1_c)
+        s1_ng = char_ngrams(s1_n, 3)
+        s1_tup = (s1_n, s1_sq, s1_a, s1_snum, s1_c, s1_nums, s1_words, s1_awords, s1_pin, s1_state, s1_city, s1_ng)
 
         s2_dict = s2_candidates.get(sid, {})
         s3_dict = s3_candidates.get(sid, {})
@@ -270,8 +263,10 @@ def main():
 
         for cid in s2_dict:
             if cid in cand_data:
-                c_tup = cand_data[cid]
-                cn, csq, ca, csnum, cc, c_nums, cw, caw, c_pin, c_state, c_city, c_ng = c_tup
+                cn, csq, ca, csnum, cc = cand_data[cid]
+                c_nums = get_all_nums(ca)
+                c_pin, c_state, c_city = extract_structured(ca, cc)
+                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split(), c_pin, c_state, c_city, char_ngrams(cn, 3))
                 exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
                 has_conflict = bool((s1_snum and csnum and s1_snum != csnum) or (s1_pin and c_pin and s1_pin != c_pin))
                 chunk_features.append(compute_pair_features(s1_tup, c_tup))
@@ -282,8 +277,10 @@ def main():
 
         for cid in s3_dict:
             if cid in cand_data:
-                c_tup = cand_data[cid]
-                cn, csq, ca, csnum, cc, c_nums, cw, caw, c_pin, c_state, c_city, c_ng = c_tup
+                cn, csq, ca, csnum, cc = cand_data[cid]
+                c_nums = get_all_nums(ca)
+                c_pin, c_state, c_city = extract_structured(ca, cc)
+                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split(), c_pin, c_state, c_city, char_ngrams(cn, 3))
                 exact_brand = (s1_n == cn and len(s1_n) >= 5 and s1_c == cc and not (s1_snum and csnum and s1_snum != csnum))
                 has_conflict = bool((s1_snum and csnum and s1_snum != csnum) or (s1_pin and c_pin and s1_pin != c_pin))
                 chunk_features.append(compute_pair_features(s1_tup, c_tup))
@@ -344,9 +341,11 @@ def main():
         else:
             best_sid = None
             best_score = -9999.0
-            cn, _, ca, csnum, _, _, _, _, c_pin, _, _, _ = cand_data[cid]
+            cn, _, ca, csnum, _ = cand_data[cid]
+            c_pin, _, _ = extract_structured(ca, '')
             for sid, prob in claims:
-                s1_n, _, s1_a, s1_snum, _, _, _, _, s1_pin, _, _, _ = s1_data[sid]
+                s1_n, _, s1_a, s1_snum, _ = s1_data[sid]
+                s1_pin, _, _ = extract_structured(s1_a, '')
                 score = prob * 100.0 + rfuzz.token_set_ratio(s1_a, ca) * 0.5 + rfuzz.token_set_ratio(s1_n, cn) * 0.2
                 if s1_snum and csnum:
                     if s1_snum == csnum: score += 30.0
