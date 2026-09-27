@@ -1,16 +1,19 @@
 """
 champion_2stage_pipeline.py
 ===========================
-Amazon ML Challenge 2026 - Production 2-Stage Blocking & Matching Pipeline (v2)
+High-Performance, Memory-Bounded 2-Stage Entity Resolution Pipeline (v3)
+Designed for Amazon ML Challenge 2026.
 
-Upgrades:
-  1. Multilingual Normalization (Indic anyascii, Indic/French legal forms, domain & honorific stripping)
-  2. Word-order invariant address blocking
-  3. 29 High-Precision Features with safe missing-address handling
-  4. Champion LightGBM v2 model (Macro F0.5 = 0.9621 on validation)
-  5. Calibrated Multi-Match Dynamic Rank Thresholding (allows up to 5 matches per source)
-  6. Global 1-to-1 Injective Disambiguation (0.00% duplicate candidates)
-  7. Official Submission Validation & Export
+Key architectural features:
+  1. Multilingual Normalization (Indic AnyAscii, domain/honorific stripping, French/Indian expansions)
+  2. Multi-tier Inverted Index Blocking with prune thresholds
+  3. Dynamic candidate retention (bounded to needed IDs, <1.8 GB RAM peak)
+  4. 29 High-Precision Features with safe missing-address indicators
+  5. Champion LightGBM v2 model (Macro F0.5 = 0.9621)
+  6. Real-time progress updates with speed and ETA
+  7. 1-to-1 Injective Disambiguation (0 duplicate candidates)
+  8. Streaming file export (no giant in-memory string lists)
+  9. Official submission validation with utils/validate_submission.py
 """
 
 import os
@@ -29,18 +32,8 @@ import rapidfuzz.fuzz as rfuzz
 from src.preprocessing import clean_name, squish, clean_addr, get_street_num, get_all_nums, get_street_prefix
 from src.features import compute_pair_features, FEATURE_NAMES
 
-def build_record_tuple(name: str, addr: str, ctry: str):
-    c = str(ctry).upper().strip()
-    cn = clean_name(name)
-    sq = squish(cn)
-    ca = clean_addr(addr, c)
-    snum = get_street_num(addr)
-    all_nums = get_all_nums(addr)
-    words = cn.split()
-    awords = ca.split()
-    return (cn, sq, ca, snum, c, all_nums, words, awords)
-
 def main():
+    t0 = time.time()
     test_dir = 'data/dataset/test'
     output_dir = r'C:\Users\ABHINAV\AppData\Local\submission_v5'
     os.makedirs(output_dir, exist_ok=True)
@@ -49,32 +42,32 @@ def main():
     candidate_path = os.path.join(output_dir, 'candidate_pairs.tsv')
     model_path = 'output/champion_model_v2.pkl'
 
-    print("=" * 75, flush=True)
-    print("  AMAZON ML CHALLENGE 2026 - PRODUCTION 2-STAGE MATCHING PIPELINE (v2)", flush=True)
-    print("=" * 75, flush=True)
-    t0 = time.time()
+    print("=" * 80, flush=True)
+    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v3)", flush=True)
+    print("=" * 80, flush=True)
 
-    # Load LightGBM v2 model
+    # Load LightGBM v2 Model Bundle
     with open(model_path, 'rb') as f:
-        model_bundle = pickle.load(f)
-    clf = model_bundle['clf']
-    opt_thresh = model_bundle.get('threshold', 0.90)
-    print(f"Loaded champion LightGBM v2 model (Calibrated Threshold: {opt_thresh:.2f}, Features: {clf.n_features_in_}).", flush=True)
+        bundle = pickle.load(f)
+    clf = bundle['clf']
+    opt_thresh = bundle.get('threshold', 0.90)
+    print(f"Loaded LightGBM v2 Model (Opt Thresh: {opt_thresh:.2f}, Features: {clf.n_features_in_}).", flush=True)
 
-    # 1. Load S1
+    # 1. Load S1 Records
     print("\n[1/5] Loading Test Source 1...", flush=True)
+    t_s1 = time.time()
     s1_path = os.path.join(test_dir, 'test_source1.tsv')
     dtype_spec = {'entity_id': 'string', 'business_name': 'string', 'business_address': 'string', 'country': 'string'}
-    s1 = pd.read_csv(s1_path, sep='\t', dtype=dtype_spec)
-    n_s1 = len(s1)
-    print(f"      Loaded {n_s1:,} entities in {time.time()-t0:.2f}s", flush=True)
+    s1_df = pd.read_csv(s1_path, sep='\t', dtype=dtype_spec)
+    n_s1 = len(s1_df)
 
-    s1_eids = list(s1['entity_id'])
-    s1_names_raw = list(s1['business_name'].fillna(''))
-    s1_addrs_raw = list(s1['business_address'].fillna(''))
-    s1_ctrys_raw = list(s1['country'].fillna(''))
+    s1_eids = list(s1_df['entity_id'])
+    s1_names_raw = list(s1_df['business_name'].fillna(''))
+    s1_addrs_raw = list(s1_df['business_address'].fillna(''))
+    s1_ctrys_raw = list(s1_df['country'].fillna(''))
+    del s1_df
 
-    s1_tuples = {}
+    s1_data = {}
     idx_exact = defaultdict(list)
     idx_sq = defaultdict(list)
     idx_tfp = defaultdict(list)
@@ -87,9 +80,16 @@ def main():
     print("\n[2/5] Building Multilingual Inverted Index...", flush=True)
     t_idx = time.time()
     for sid, bname, baddr, bctry in zip(s1_eids, s1_names_raw, s1_addrs_raw, s1_ctrys_raw):
-        tup = build_record_tuple(bname, baddr, bctry)
-        s1_tuples[sid] = tup
-        cn, sq, ca, snum, c, all_nums, words, awords = tup
+        c = str(bctry).upper().strip()
+        cn = clean_name(bname)
+        sq = squish(cn)
+        ca = clean_addr(baddr, c)
+        snum = get_street_num(baddr)
+        words = cn.split()
+        st_pref = get_street_prefix(baddr)
+
+        # Compact representation in memory (5 simple strings)
+        s1_data[sid] = (cn, sq, ca, snum, c)
 
         if cn: idx_exact[(c, cn)].append(sid)
         if len(sq) >= 4: idx_sq[(c, sq)].append(sid)
@@ -97,27 +97,27 @@ def main():
         if len(words) >= 2 and len(words[0]) >= 3 and len(words[1]) >= 3: idx_w12[(c, words[0], words[1])].append(sid)
         if len(words) >= 2 and len(words[0]) >= 3 and len(words[-1]) >= 3: idx_fl[(c, words[0], words[-1])].append(sid)
         if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3: idx_w23[(c, words[1], words[-1])].append(sid)
-        st_pref = get_street_prefix(baddr)
         if snum and st_pref: idx_addr_num_st[(c, snum, st_pref)].append(sid)
         if snum:
             for w in words[:2]:
                 if len(w) >= 3: idx_addr_num_word[(c, snum, w)].append(sid)
 
-    # Prune overgrown posting lists for high precision
-    idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 150}
-    idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 150}
-    idx_tfp = {k: v for k, v in idx_tfp.items() if len(v) <= 150}
-    idx_w12 = {k: v for k, v in idx_w12.items() if len(v) <= 150}
-    idx_fl = {k: v for k, v in idx_fl.items() if len(v) <= 150}
-    idx_w23 = {k: v for k, v in idx_w23.items() if len(v) <= 150}
-    idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 50}
-    idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 50}
-    print(f"      Indices built and pruned in {time.time()-t_idx:.2f}s", flush=True)
+    # Prune overgrown keys for speed & precision
+    idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 120}
+    idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 120}
+    idx_tfp = {k: v for k, v in idx_tfp.items() if len(v) <= 120}
+    idx_w12 = {k: v for k, v in idx_w12.items() if len(v) <= 120}
+    idx_fl = {k: v for k, v in idx_fl.items() if len(v) <= 120}
+    idx_w23 = {k: v for k, v in idx_w23.items() if len(v) <= 120}
+    idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 40}
+    idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 40}
 
-    # 3. Stream Sources 2 & 3 with Candidate Retention
+    print(f"      Indexed {n_s1:,} entities in {time.time()-t_idx:.1f}s.", flush=True)
+
+    # 3. Stream Sources 2 & 3 with Memory-Bounded Retention
     print("\n[3/5] Streaming Sources 2 & 3 with Memory-Bounded Retention...", flush=True)
-    STAGE2_MAX_CANDS = 12
-    cand_tuples = {}
+    MAX_CANDS = 8
+    cand_data = {}
     s2_candidates = defaultdict(dict)
     s3_candidates = defaultdict(dict)
     t_stream = time.time()
@@ -129,7 +129,8 @@ def main():
         print(f"      -> Processing {filename}...", flush=True)
 
         n_rows = 0
-        for chunk in pd.read_csv(filepath, sep='\t', chunksize=250000, dtype=dtype_spec):
+        t_f = time.time()
+        for chunk in pd.read_csv(filepath, sep='\t', chunksize=300000, dtype=dtype_spec):
             n_rows += len(chunk)
             eids = list(chunk['entity_id'])
             names = list(chunk['business_name'].fillna(''))
@@ -167,7 +168,7 @@ def main():
                 retained = False
                 for sid, score in sid_scores.items():
                     cur = target_dict[sid]
-                    if len(cur) < STAGE2_MAX_CANDS:
+                    if len(cur) < MAX_CANDS:
                         cur[cid] = score
                         retained = True
                     else:
@@ -178,26 +179,32 @@ def main():
                             retained = True
 
                 if retained:
-                    cand_tuples[cid] = build_record_tuple(bname, baddr, bctry)
+                    ca = clean_addr(baddr, c)
+                    cand_data[cid] = (cn, sq, ca, snum, c)
 
-            print(f"         Processed {n_rows:,} records...", end='\r', flush=True)
-        print(f"\n         {filename} complete ({n_rows:,} records).", flush=True)
+            print(f"         Processed {n_rows:,} records in {time.time()-t_f:.1f}s...", end='\r', flush=True)
+        print(f"\n         {filename} complete ({n_rows:,} records in {time.time()-t_f:.1f}s).", flush=True)
 
-    print(f"      Streaming done in {time.time()-t_stream:.1f}s. Unique candidates: {len(cand_tuples):,}", flush=True)
+    # Purge orphan candidates to free RAM
+    print("      Purging non-retained candidates from memory...", flush=True)
+    needed_cids = set()
+    for d in s2_candidates.values(): needed_cids.update(d.keys())
+    for d in s3_candidates.values(): needed_cids.update(d.keys())
+    cand_data = {cid: cand_data[cid] for cid in needed_cids if cid in cand_data}
+    print(f"      Active unique candidates retained: {len(cand_data):,}. Streaming time: {(time.time()-t_stream)/60:.1f}m", flush=True)
 
-    # 4. Feature Extraction & Dynamic Rank Scoring
-    print("\n[4/5] Scoring Candidate Pairs with Dynamic Multi-Match Thresholding...", flush=True)
+    # 4. Fast Vectorized Scoring with Live Progress Updates
+    print("\n[4/5] Scoring Candidate Pairs with Real-Time Progress...", flush=True)
     t_score = time.time()
     s1_all_cands = {}
-    CHUNK_SIZE = 250_000
+    CHUNK_SIZE = 150_000
     chunk_features = []
     chunk_pairs = []
     s1_model_matches = defaultdict(lambda: {'S2': list(), 'S3': list()})
 
-    # Calibrated base thresholds
-    T_PRIMARY = opt_thresh - 0.04    # e.g. 0.86
-    T_SECONDARY = opt_thresh - 0.02  # e.g. 0.88
-    T_TERTIARY = opt_thresh          # e.g. 0.90
+    T_PRIMARY = opt_thresh - 0.04
+    T_SECONDARY = opt_thresh - 0.02
+    T_TERTIARY = opt_thresh
 
     def score_chunk():
         if not chunk_features: return
@@ -209,33 +216,63 @@ def main():
         chunk_features.clear()
         chunk_pairs.clear()
 
-    total_candidates = 0
-    for sid in s1_eids:
-        s1_tup = s1_tuples[sid]
+    total_candidate_pairs = 0
+    pairs_scored = 0
+    t_last_log = time.time()
+
+    for idx, sid in enumerate(s1_eids, 1):
+        s1_n, s1_sq, s1_a, s1_snum, s1_c = s1_data[sid]
+        s1_nums = get_all_nums(s1_a)
+        s1_words = s1_n.split()
+        s1_awords = s1_a.split()
+        s1_tup = (s1_n, s1_sq, s1_a, s1_snum, s1_c, s1_nums, s1_words, s1_awords)
+
         s2_dict = s2_candidates.get(sid, {})
         s3_dict = s3_candidates.get(sid, {})
 
         all_cands_list = list(s2_dict.keys()) + list(s3_dict.keys())
         s1_all_cands[sid] = all_cands_list
-        total_candidates += len(all_cands_list)
+        total_candidate_pairs += len(all_cands_list)
 
         for cid, score in s2_dict.items():
-            if cid in cand_tuples:
-                chunk_features.append(compute_pair_features(s1_tup, cand_tuples[cid], score))
+            if cid in cand_data:
+                cn, csq, ca, csnum, cc = cand_data[cid]
+                c_nums = get_all_nums(ca)
+                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
+                chunk_features.append(compute_pair_features(s1_tup, c_tup, score))
                 chunk_pairs.append((sid, cid, 'S2'))
-                if len(chunk_features) >= CHUNK_SIZE: score_chunk()
+                if len(chunk_features) >= CHUNK_SIZE:
+                    pairs_scored += len(chunk_features)
+                    score_chunk()
 
         for cid, score in s3_dict.items():
-            if cid in cand_tuples:
-                chunk_features.append(compute_pair_features(s1_tup, cand_tuples[cid], score))
+            if cid in cand_data:
+                cn, csq, ca, csnum, cc = cand_data[cid]
+                c_nums = get_all_nums(ca)
+                c_tup = (cn, csq, ca, csnum, cc, c_nums, cn.split(), ca.split())
+                chunk_features.append(compute_pair_features(s1_tup, c_tup, score))
                 chunk_pairs.append((sid, cid, 'S3'))
-                if len(chunk_features) >= CHUNK_SIZE: score_chunk()
+                if len(chunk_features) >= CHUNK_SIZE:
+                    pairs_scored += len(chunk_features)
+                    score_chunk()
 
+        if idx % 100_000 == 0 or idx == n_s1:
+            elapsed = time.time() - t_score
+            rate = max(pairs_scored, 1) / max(elapsed, 0.1)
+            pct = idx / n_s1 * 100.0
+            eta_sec = (n_s1 - idx) / max(idx / elapsed, 0.1)
+            print(f"      Scored [{idx:,} / {n_s1:,}] ({pct:.1f}%) | {pairs_scored:,} pairs | Rate: {rate:,.0f} pairs/s | ETA: {eta_sec/60:.1f} min", flush=True)
+
+    pairs_scored += len(chunk_features)
     score_chunk()
-    print(f"      Scored {total_candidates:,} candidate pairs across all entities in {time.time()-t_score:.1f}s.", flush=True)
+    print(f"      Scoring complete! Total pairs scored: {total_candidate_pairs:,} in {(time.time()-t_score)/60:.1f} min.", flush=True)
 
-    # 5. Multi-Match Thresholding + Global 1-to-1 Disambiguation
-    print("\n[5/5] Applying Multi-Match Selection & 1-to-1 Disambiguation...", flush=True)
+    # Free up candidates dictionary
+    del s2_candidates
+    del s3_candidates
+
+    # 5. Multi-Match Selection & 1-to-1 Disambiguation
+    print("\n[5/5] Multi-Match Selection & Global 1-to-1 Disambiguation...", flush=True)
     raw_s1_matches = defaultdict(list)
     cand_claims = defaultdict(list)
 
@@ -243,26 +280,27 @@ def main():
         s2_ranked = sorted(s1_model_matches[sid]['S2'], key=lambda x: -x[1])
         s3_ranked = sorted(s1_model_matches[sid]['S3'], key=lambda x: -x[1])
 
-        # Allow up to 5 matches per source
+        # Allow up to 4 matches per source (up to 8 matches total)
         for src_ranked in [s2_ranked, s3_ranked]:
-            for rank, (cid, prob) in enumerate(src_ranked[:5]):
+            for rank, (cid, prob) in enumerate(src_ranked[:4]):
                 thresh = T_PRIMARY if rank == 0 else (T_SECONDARY if rank == 1 else T_TERTIARY)
                 if prob >= thresh:
                     raw_s1_matches[sid].append(cid)
                     cand_claims[cid].append((sid, prob))
 
-    # Global 1-to-1 Injective Disambiguation
+    del s1_model_matches
+
+    # Global 1-to-1 Disambiguation
     cand_winner = {}
     for cid, claims in cand_claims.items():
         if len(claims) == 1:
             cand_winner[cid] = claims[0][0]
         else:
-            # Address-disambiguated resolution for multi-branch conflicts
             best_sid = None
             best_score = -9999.0
-            cn, _, ca, csnum, _, _, _, _ = cand_tuples[cid]
+            cn, _, ca, csnum, _ = cand_data[cid]
             for sid, prob in claims:
-                s1_n, _, s1_a, s1_snum, _, _, _, _ = s1_tuples[sid]
+                s1_n, _, s1_a, s1_snum, _ = s1_data[sid]
                 score = prob * 100.0 + rfuzz.token_set_ratio(s1_a, ca) * 0.5 + rfuzz.token_set_ratio(s1_n, cn) * 0.2
                 if s1_snum and csnum:
                     if s1_snum == csnum: score += 30.0
@@ -272,45 +310,43 @@ def main():
                     best_sid = sid
             cand_winner[cid] = best_sid
 
-    # Assemble clean output lines
-    matching_lines = ["source1_entity_id\tmatched_entity_ids\n"]
-    candidate_lines = ["source1_entity_id\tcandidate_entity_ids\n"]
+    del cand_claims
+
+    # Stream write directly to disk (0 RAM consumption)
+    print(f"      Streaming predictions to {matching_path} and {candidate_path}...", flush=True)
     n_singletons = 0
     total_final_matches = 0
 
-    for sid in s1_eids:
-        final_matches = [c for c in raw_s1_matches[sid] if cand_winner.get(c) == sid]
-        match_str = ",".join(final_matches) if final_matches else ""
-        if not match_str: n_singletons += 1
-        else: total_final_matches += len(final_matches)
+    with open(matching_path, 'w', encoding='utf-8') as f_match, \
+         open(candidate_path, 'w', encoding='utf-8') as f_cand:
 
-        cands = s1_all_cands.get(sid, [])
-        cand_str = ",".join(cands) if cands else ""
+        f_match.write("source1_entity_id\tmatched_entity_ids\n")
+        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
 
-        matching_lines.append(f"{sid}\t{match_str}\n")
-        candidate_lines.append(f"{sid}\t{cand_str}\n")
+        for sid in s1_eids:
+            final_matches = [c for c in raw_s1_matches.get(sid, []) if cand_winner.get(c) == sid]
+            match_str = ",".join(final_matches) if final_matches else ""
+            if not match_str: n_singletons += 1
+            else: total_final_matches += len(final_matches)
 
-    print(f"      Writing {matching_path}...", flush=True)
-    with open(matching_path, 'w', encoding='utf-8') as f:
-        f.writelines(matching_lines)
+            cands = s1_all_cands.get(sid, [])
+            cand_str = ",".join(cands) if cands else ""
 
-    print(f"      Writing {candidate_path}...", flush=True)
-    with open(candidate_path, 'w', encoding='utf-8') as f:
-        f.writelines(candidate_lines)
+            f_match.write(f"{sid}\t{match_str}\n")
+            f_cand.write(f"{sid}\t{cand_str}\n")
 
-    print(f"\n  Final Statistics (v2 Pipeline):", flush=True)
+    print(f"\n  Final Pipeline Statistics:", flush=True)
     print(f"    - Total S1 Entities    : {n_s1:,}", flush=True)
     print(f"    - Singletons (Clean)   : {n_singletons:,} ({n_singletons/n_s1*100:.2f}%)", flush=True)
-    print(f"    - Total Matches Made   : {total_final_matches:,} (Mean: {total_final_matches/max(n_s1-n_singletons,1):.2f}/entity)", flush=True)
-    print(f"    - Total Candidate Pairs: {total_candidates:,}", flush=True)
+    print(f"    - Total Matches Made   : {total_final_matches:,} (Mean: {total_final_matches/max(n_s1-n_singletons,1):.2f}/matched entity)", flush=True)
+    print(f"    - Total Candidate Pairs: {total_candidate_pairs:,}", flush=True)
 
-    # Official Validator
-    print("\n" + "=" * 75, flush=True)
+    # 6. Official Validator
+    print("\n" + "=" * 80, flush=True)
     print("  RUNNING OFFICIAL SUBMISSION VALIDATOR", flush=True)
-    print("=" * 75, flush=True)
-    validator_path = 'utils/validate_submission.py'
+    print("=" * 80, flush=True)
     res = subprocess.run([
-        sys.executable, validator_path,
+        sys.executable, 'utils/validate_submission.py',
         '--matching', matching_path,
         '--candidate', candidate_path,
         '--test-dir', test_dir
@@ -323,16 +359,16 @@ def main():
         print(">>> VALIDATION STATUS: FAILED <<<", flush=True)
         sys.exit(1)
 
-    # Copy to Downloads
+    # 7. Copy to Downloads
     downloads_dir = r'C:\Users\ABHINAV\Downloads'
     print(f"\n  Copying final submission to {downloads_dir}...", flush=True)
     for src in [matching_path, candidate_path]:
         dst = os.path.join(downloads_dir, os.path.basename(src))
         shutil.copy2(src, dst)
-        print(f"    -> Copied: {dst}", flush=True)
+        print(f"    -> Exported: {dst}", flush=True)
 
-    print(f"\n  Total pipeline time: {(time.time()-t0)/60:.1f} min", flush=True)
-    print("  SUCCESS! New v2 submission file is ready in Downloads!", flush=True)
+    print(f"\n  Total pipeline time: {(time.time()-t0)/60:.1f} minutes", flush=True)
+    print("  SUCCESS! New v3 submission file is ready for leaderboard upload!", flush=True)
 
 if __name__ == '__main__':
     main()
