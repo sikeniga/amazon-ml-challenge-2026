@@ -40,20 +40,20 @@ def main():
 
     matching_path = os.path.join(output_dir, 'matching_results.tsv')
     candidate_path = os.path.join(output_dir, 'candidate_pairs.tsv')
-    model_path = 'output/champion_model_v3.pkl'
+    model_path = 'output/champion_model_v4.pkl'
 
     print("=" * 80, flush=True)
-    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v4)", flush=True)
+    print("  AMAZON ML CHALLENGE 2026 - ULTRA-FAST PRODUCTION PIPELINE (v5)", flush=True)
     print("=" * 80, flush=True)
 
-    # Load LightGBM v3 Model Bundle
+    # Load LightGBM v4 Model Bundle
     with open(model_path, 'rb') as f:
         bundle = pickle.load(f)
     clf = bundle['clf']
-    t_prim = bundle.get('t_primary', 0.65)
-    t_sec = bundle.get('t_secondary', 0.75)
-    t_tert = bundle.get('t_tertiary', 0.82)
-    print(f"Loaded LightGBM v3 Model (T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f}, Features: {clf.n_features_in_}).", flush=True)
+    t_prim = bundle.get('t_primary', 0.78)
+    t_sec = bundle.get('t_secondary', 0.86)
+    t_tert = bundle.get('t_tertiary', 0.90)
+    print(f"Loaded LightGBM v4 Model (T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f}, Features: {clf.n_features_in_}).", flush=True)
 
     # 1. Load S1 Records
     print("\n[1/5] Loading Test Source 1...", flush=True)
@@ -213,7 +213,7 @@ def main():
         X = np.array(chunk_features, dtype=np.float32)
         probs = clf.predict_proba(X)[:, 1]
         for (sid, cid, src, exact_brand), prob in zip(chunk_pairs, probs):
-            min_t = 0.50 if exact_brand else T_PRIMARY
+            min_t = (T_PRIMARY - 0.05) if exact_brand else T_PRIMARY
             if prob >= min_t:
                 s1_model_matches[sid][src].append((cid, prob, exact_brand))
         chunk_features.clear()
@@ -276,8 +276,8 @@ def main():
     del s2_candidates
     del s3_candidates
 
-    # 5. Multi-Match Selection & 1-to-1 Disambiguation
-    print("\n[5/5] Multi-Match Selection & Global 1-to-1 Disambiguation...", flush=True)
+    # 5. Multi-Match Selection & 1-to-1 Disambiguation (98% Precision Guardrail)
+    print("\n[5/5] Multi-Match Selection & Global 1-to-1 Disambiguation (98% Precision Guardrail)...", flush=True)
     raw_s1_matches = defaultdict(list)
     cand_claims = defaultdict(list)
 
@@ -285,13 +285,19 @@ def main():
         s2_ranked = sorted(s1_model_matches[sid]['S2'], key=lambda x: -x[1])
         s3_ranked = sorted(s1_model_matches[sid]['S3'], key=lambda x: -x[1])
 
-        # Allow up to 4 matches per source (up to 8 matches total)
+        # Precision Guardrail: at most 2 matches from S2 and at most 2 from S3, maximum 3 matches total
+        ent_matches = []
         for src_ranked in [s2_ranked, s3_ranked]:
-            for rank, (cid, prob, exact_brand) in enumerate(src_ranked[:4]):
-                thresh = (0.50 if exact_brand else T_PRIMARY) if rank == 0 else (T_SECONDARY if rank == 1 else T_TERTIARY)
+            for rank, (cid, prob, exact_brand) in enumerate(src_ranked[:2]):
+                thresh = (T_PRIMARY - 0.05 if exact_brand else T_PRIMARY) if rank == 0 else T_SECONDARY
                 if prob >= thresh:
-                    raw_s1_matches[sid].append(cid)
-                    cand_claims[cid].append((sid, prob))
+                    ent_matches.append((cid, prob))
+
+        # Sort all accepted candidates by probability descending and keep at most 3
+        ent_matches.sort(key=lambda x: -x[1])
+        for cid, prob in ent_matches[:3]:
+            raw_s1_matches[sid].append(cid)
+            cand_claims[cid].append((sid, prob))
 
     del s1_model_matches
 

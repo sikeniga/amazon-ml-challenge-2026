@@ -26,12 +26,17 @@ INDIAN_STATE_SYNONYMS = {
     r'\bgj\b': 'gujarat', r'\brj\b': 'rajasthan', r'\bts\b': 'telangana',
     r'\bap\b': 'andhra pradesh', r'\bkl\b': 'kerala', r'\bhr\b': 'haryana',
     r'\bmp\b': 'madhya pradesh', r'\bpb\b': 'punjab', r'\bod\b': 'odisha',
-    r'\bjh\b': 'jharkhand', r'\bbr\b': 'bihar', r'\bcg\b': 'chhattisgarh',
-    r'\bga\b': 'goa', r'\bas\b': 'assam',
+    r'\bor\b': 'odisha', r'\bjh\b': 'jharkhand', r'\bbr\b': 'bihar',
+    r'\bcg\b': 'chhattisgarh', r'\bct\b': 'chhattisgarh', r'\bga\b': 'goa',
+    r'\bas\b': 'assam', r'\buk\b': 'uttarakhand', r'\bua\b': 'uttarakhand',
+    r'\bjk\b': 'jammu kashmir', r'\bch\b': 'chandigarh', r'\btr\b': 'tripura',
     r'\bbengaluru\b': 'bangalore', r'\bmumbai\b': 'bombay',
     r'\bchennai\b': 'madras', r'\bkolkata\b': 'calcutta',
     r'\bvadodara\b': 'baroda', r'\bgurugram\b': 'gurgaon',
     r'\bpune\b': 'poona', r'\bkochi\b': 'cochin',
+    r'\bprayagraj\b': 'allahabad', r'\bmysuru\b': 'mysore',
+    r'\bvisakhapatnam\b': 'vizag', r'\bsecunderabad\b': 'hyderabad',
+    r'\bpuducherry\b': 'pondicherry', r'\bthiruvananthapuram\b': 'trivandrum',
 }
 
 FRENCH_STREET_SYNONYMS = {
@@ -60,7 +65,9 @@ RE_LEGAL_SUFFIXES = re.compile(
 )
 RE_ADDR_NOISE = re.compile(
     r'\b(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|'
-    r'suite|ste|apt|floor|fl|near|opp|behind|beside|flat|plot|no|bldg|building|chambers|tower)\b',
+    r'suite|ste|apt|floor|fl|near|opp|behind|beside|flat|plot|no|bldg|building|chambers|tower|'
+    r'complex|nagar|colony|extn|extension|sector|sec|phase|block|blk|dist|district|mandal|po|'
+    r'bazar|bazaar|marg|chowk|area|estate|industrial|indl|village|vill|city)\b',
     re.IGNORECASE
 )
 

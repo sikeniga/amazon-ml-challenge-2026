@@ -28,22 +28,31 @@ def f05_score(precision: float, recall: float) -> float:
     denom = beta2 * precision + recall
     return (1.0 + beta2) * precision * recall / denom if denom > 0 else 0.0
 
-def macro_f05(predictions: dict, ground_truth: dict) -> float:
+def macro_f05(predictions: dict, ground_truth: dict):
     scores = []
+    tot_tp, tot_fp, tot_fn = 0, 0, 0
     for s1_id, true_set in ground_truth.items():
         pred_set = predictions.get(s1_id, set())
         if not true_set and not pred_set:
             scores.append(1.0)
         elif not true_set and pred_set:
             scores.append(0.0)
+            tot_fp += len(pred_set)
         elif not pred_set:
             scores.append(0.0)
+            tot_fn += len(true_set)
         else:
             tp = len(pred_set & true_set)
+            fp = len(pred_set - true_set)
+            fn = len(true_set - pred_set)
+            tot_tp += tp; tot_fp += fp; tot_fn += fn
             p = tp / len(pred_set)
             r = tp / len(true_set)
             scores.append(f05_score(p, r))
-    return float(np.mean(scores)) if scores else 0.0
+    macro_f = float(np.mean(scores)) if scores else 0.0
+    prec = tot_tp / max(tot_tp + tot_fp, 1)
+    rec = tot_tp / max(tot_tp + tot_fn, 1)
+    return macro_f, prec, rec
 
 def build_record_tuple(name: str, addr: str, ctry: str):
     c = str(ctry).upper().strip()
@@ -278,57 +287,63 @@ def main():
         val_ent_cands[sid].sort(key=lambda x: -x[1])
 
     best_score = 0.0
-    best_t_prim = 0.60
-    best_t_sec = 0.75
-    best_t_tert = 0.85
+    best_t_prim = 0.78
+    best_t_sec = 0.86
+    best_t_tert = 0.90
+    best_p, best_r = 0.0, 0.0
 
-    # Sweep primary from 0.45 to 0.85
-    for t_prim in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]:
-        for t_sec in [0.70, 0.75, 0.80, 0.85]:
+    # Sweep primary, secondary, and tertiary thresholds
+    for t_prim in [0.65, 0.70, 0.75, 0.78, 0.80, 0.82, 0.85]:
+        for t_sec in [0.80, 0.84, 0.87, 0.90]:
             if t_sec < t_prim: continue
-            for t_tert in [0.80, 0.85, 0.90]:
+            for t_tert in [0.88, 0.92, 0.95]:
                 if t_tert < t_sec: continue
                 preds = defaultdict(set)
                 for sid in val_eids:
                     cands = val_ent_cands.get(sid, [])
-                    for rank, (cid, p) in enumerate(cands[:4]):
+                    for rank, (cid, p) in enumerate(cands[:3]):
                         thresh = t_prim if rank == 0 else (t_sec if rank == 1 else t_tert)
                         if p >= thresh:
                             preds[sid].add(cid)
 
-                score = macro_f05(preds, val_gt)
+                score, prec, rec = macro_f05(preds, val_gt)
                 if score > best_score:
                     best_score = score
                     best_t_prim = t_prim
                     best_t_sec = t_sec
                     best_t_tert = t_tert
+                    best_p, best_r = prec, rec
                     n_empty = sum(1 for sid in val_eids if len(preds.get(sid, set())) == 0)
                     pct_empty = n_empty / len(val_eids) * 100.0
-                    print(f"    * NEW BEST * T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f} -> Macro F0.5 = {score:.4f} (Singletons: {pct_empty:.2f}%)", flush=True)
+                    tot_m = sum(len(x) for x in preds.values())
+                    mean_m = tot_m / max(len(val_eids) - n_empty, 1)
+                    print(f"    * NEW BEST * T_Prim: {t_prim:.2f}, T_Sec: {t_sec:.2f}, T_Tert: {t_tert:.2f} -> Macro F0.5 = {score:.4f} | Prec: {prec:.4f} | Rec: {rec:.4f} | Mean M: {mean_m:.2f} (Singletons: {pct_empty:.2f}%)", flush=True)
 
-    print(f"\n>>> OPTIMAL MULTI-TIER THRESHOLDS <<<", flush=True)
+    print(f"\n>>> OPTIMAL MULTI-TIER THRESHOLDS (v4) <<<", flush=True)
     print(f"    T_PRIMARY   : {best_t_prim:.2f}", flush=True)
     print(f"    T_SECONDARY : {best_t_sec:.2f}", flush=True)
     print(f"    T_TERTIARY  : {best_t_tert:.2f}", flush=True)
-    print(f"    Validation Macro F0.5: {best_score:.4f}", flush=True)
+    print(f"    Validation Macro F0.5: {best_score:.4f} (Precision: {best_p:.4f}, Recall: {best_r:.4f})", flush=True)
 
     # Feature Importances
-    print("\n  Top Feature Importances (v3):", flush=True)
+    print("\n  Top Feature Importances (v4):", flush=True)
     importances = clf.feature_importances_
     sorted_idx = np.argsort(importances)[::-1]
     for rank, idx in enumerate(sorted_idx[:15], 1):
         print(f"    {rank:2d}. {FEATURE_NAMES[idx]:<26} : {importances[idx]}", flush=True)
 
-    # Save Model Bundle v3
+    # Save Model Bundle v4
     output_dir = 'output'
     os.makedirs(output_dir, exist_ok=True)
-    bundle_path = os.path.join(output_dir, 'champion_model_v3.pkl')
+    bundle_path = os.path.join(output_dir, 'champion_model_v4.pkl')
     bundle = {
         'clf': clf,
         't_primary': best_t_prim,
         't_secondary': best_t_sec,
         't_tertiary': best_t_tert,
         'val_f05': best_score,
+        'val_prec': best_p,
+        'val_rec': best_r,
         'feature_names': FEATURE_NAMES
     }
     with open(bundle_path, 'wb') as f:

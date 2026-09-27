@@ -34,7 +34,7 @@ FEATURE_NAMES = [
     'first_tok_jw',
     'last_tok_jw',
 
-    # 2. ADDRESS SIMILARITIES & MISSING FLAGS (15-21)
+    # 2. ADDRESS SIMILARITIES & MISSING FLAGS (15-24)
     'both_have_addr',
     'addr_either_missing',
     'jw_a',
@@ -42,6 +42,9 @@ FEATURE_NAMES = [
     'tset_a',
     'exact_a',
     'addr_jaccard',
+    'addr_containment',
+    'addr_shared_tokens',
+    'city_or_state_match',
 
     # 3. NUMBERS & STREET NUMBERS (22-25)
     'snum_match',
@@ -115,9 +118,16 @@ def compute_pair_features(s1_tuple, cand_tuple, prio: float = 0.0) -> list:
         exact_a = float(s1_a == ca and s1_a != '')
         if s1_aw and caw:
             aset1 = set(s1_aw); aset2 = set(caw)
-            addr_jaccard = len(aset1 & aset2) / len(aset1 | aset2)
+            inter = len(aset1 & aset2)
+            addr_jaccard = inter / len(aset1 | aset2)
+            addr_containment = inter / max(min(len(aset1), len(aset2)), 1)
+            addr_shared_tokens = float(inter)
+            city_or_state_match = float(bool(set(s1_aw[-2:]) & set(caw[-2:])))
         else:
             addr_jaccard = 0.0
+            addr_containment = 0.0
+            addr_shared_tokens = 0.0
+            city_or_state_match = 0.0
     else:
         # Neutral default values so missing address is NOT penalized as a conflicting address
         jw_a = 0.50
@@ -125,6 +135,9 @@ def compute_pair_features(s1_tuple, cand_tuple, prio: float = 0.0) -> list:
         tset_a = 0.50
         exact_a = 0.0
         addr_jaccard = 0.0
+        addr_containment = 0.50
+        addr_shared_tokens = 0.0
+        city_or_state_match = 0.50
 
     # 4. Street Numbers & Number Set Matching
     snum_match = float(s1_snum == csnum and s1_snum != '')
@@ -147,6 +160,7 @@ def compute_pair_features(s1_tuple, cand_tuple, prio: float = 0.0) -> list:
         jw_n, ts_n, tset_n, ratio_n, pr_n, exact_n, name_exact_clean, exact_sq, jw_sq,
         name_starts_with, name_contains, name_jaccard, name_len_diff, first_tok_jw, last_tok_jw,
         both_have_addr, addr_either_missing, jw_a, ts_a, tset_a, exact_a, addr_jaccard,
+        addr_containment, addr_shared_tokens, city_or_state_match,
         snum_match, snum_conflict, shared_nums_count, disjoint_nums,
         cross_prod, high_name_high_addr, high_name_missing_addr, high_name_addr_conflict,
         country_match
