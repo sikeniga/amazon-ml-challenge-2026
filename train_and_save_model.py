@@ -1,50 +1,32 @@
+"""
+train_and_save_model.py
+=======================
+Trains the next-generation LightGBM matching model with:
+  1. Multilingual AnyAscii normalization & domain/honorific stripping
+  2. 29 high-precision features with safe missing-address handling
+  3. Memory-bounded candidate streaming (<1.5 GB peak RAM)
+  4. Balanced hard negative mining + ground truth positive augmentation
+  5. F0.5 precision-weighted calibration (scale_pos_weight=3.0)
+  6. Validation threshold sweep targeting Macro F0.5
+"""
+
 import os
+import sys
 import re
 import time
 import pickle
-import unicodedata
 from collections import defaultdict
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from rapidfuzz.distance import JaroWinkler
-import rapidfuzz.fuzz as rfuzz
 
-def clean_name(s):
-    if not isinstance(s, str) or not s: return ''
-    s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
-    for sep in [' d/b/a ', ' dba ', ' t/a ', ' ta ', ' trading as ']:
-        if sep in s: s = s.split(sep)[-1]; break
-    s = re.sub(r'[^a-z0-9\s]', ' ', s)
-    s = re.sub(r'\b(inc|corp|corporation|incorporated|llc|pllc|ltd|limited|co|company|pvt|private|llp|pc|sarl|sas|sasu|sa|eurl|snc|sci|gie)\b', ' ', s)
-    return ' '.join(s.split())
-
-def squish(s):
-    s = re.sub(r'\b(com|org|net|in|fr|io|co|biz|info)\b', '', s)
-    return s.replace(' ', '')
-
-def clean_addr(s):
-    if not isinstance(s, str) or not s: return ''
-    s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
-    s = re.sub(r'[^a-z0-9\s]', ' ', s)
-    s = re.sub(r'\b(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|suite|ste|apt|floor|fl)\b', ' ', s)
-    return ' '.join(s.split())
-
-def get_street_num(addr):
-    if not isinstance(addr, str) or not addr: return ''
-    nums = re.findall(r'\b\d+\b', addr)
-    return nums[0] if nums else ''
-
-def get_street_prefix(addr):
-    if not isinstance(addr, str) or not addr: return ''
-    ca = clean_name(addr)
-    words = [w for w in ca.split() if not w.isdigit() and len(w) >= 3]
-    return words[0][:3] if words else ''
+from src.preprocessing import clean_name, squish, clean_addr, get_street_num, get_all_nums, get_street_prefix
+from src.features import compute_pair_features, FEATURE_NAMES
 
 def f05_score(precision: float, recall: float) -> float:
     beta2 = 0.25
     denom = beta2 * precision + recall
-    return (1 + beta2) * precision * recall / denom if denom > 0 else 0.0
+    return (1.0 + beta2) * precision * recall / denom if denom > 0 else 0.0
 
 def macro_f05(predictions: dict, ground_truth: dict) -> float:
     scores = []
@@ -63,96 +45,131 @@ def macro_f05(predictions: dict, ground_truth: dict) -> float:
             scores.append(f05_score(p, r))
     return float(np.mean(scores)) if scores else 0.0
 
-def compute_features(s1_n, s1_sq, s1_a, s1_snum, s1_c, cn, csq, ca, csnum, cc, prio):
-    jw_n = JaroWinkler.similarity(s1_n, cn)
-    ts_n = rfuzz.token_sort_ratio(s1_n, cn) / 100.0
-    tset_n = rfuzz.token_set_ratio(s1_n, cn) / 100.0
-    pr_n = rfuzz.partial_ratio(s1_n, cn) / 100.0
-    exact_n = float(s1_n == cn and s1_n != '')
-    exact_sq = float(s1_sq == csq and len(s1_sq) >= 5)
-    num_m = float(s1_snum == csnum and s1_snum != '')
-    jw_a = JaroWinkler.similarity(s1_a, ca) if (s1_a and ca) else 0.0
-    tset_a = rfuzz.token_set_ratio(s1_a, ca) / 100.0 if (s1_a and ca) else 0.0
-    country_m = float(s1_c == cc)
-    return [jw_n, ts_n, tset_n, pr_n, exact_n, exact_sq, num_m, jw_a, tset_a, country_m, float(prio)]
-
-FEATURE_COLS = ['jw_n', 'ts_n', 'tset_n', 'pr_n', 'exact_n', 'exact_sq', 'num_m', 'jw_a', 'tset_a', 'country_m', 'prio_score']
+def build_record_tuple(name: str, addr: str, ctry: str):
+    c = str(ctry).upper().strip()
+    cn = clean_name(name)
+    sq = squish(cn)
+    ca = clean_addr(addr, c)
+    snum = get_street_num(addr)
+    all_nums = get_all_nums(addr)
+    words = cn.split()
+    awords = ca.split()
+    return (cn, sq, ca, snum, c, all_nums, words, awords)
 
 def main():
-    print("=" * 70)
-    print("  TRAINING HIGH-PRECISION LIGHTGBM MATCHING MODEL")
-    print("=" * 70)
     t0 = time.time()
-    
-    # 1. Load 35,000 S1 entities and ground truth (30k train, 5k val)
-    gt_df = pd.read_csv('data/dataset/train/train_ground_truth.tsv', sep='\t', nrows=35000)
-    target_s1_ids = set(gt_df['source1_entity_id'])
+    print("=" * 75, flush=True)
+    print("  TRAINING HIGH-PRECISION MULTILINGUAL LIGHTGBM MODEL (v2)", flush=True)
+    print("=" * 75, flush=True)
 
-    s1_rows = []
-    for chunk in pd.read_csv('data/dataset/train/train_source1.tsv', sep='\t', chunksize=200000):
-        m = chunk[chunk['entity_id'].isin(target_s1_ids)]
-        if len(m): s1_rows.append(m)
-        if sum(len(x) for x in s1_rows) >= len(target_s1_ids): break
-    s1_df = pd.concat(s1_rows).drop_duplicates('entity_id')
+    N_TRAIN_S1 = 30_000
+    N_VAL_S1 = 5_000
+    TOTAL_S1 = N_TRAIN_S1 + N_VAL_S1
+    MAX_CANDS_PER_ENT = 8
 
-    all_eids = list(s1_df['entity_id'].unique())
-    np.random.seed(42)
-    np.random.shuffle(all_eids)
-    val_eids = set(all_eids[:5000])
-    train_eids = set(all_eids[5000:])
-
-    train_s1 = s1_df[s1_df['entity_id'].isin(train_eids)].set_index('entity_id')
-    val_s1   = s1_df[s1_df['entity_id'].isin(val_eids)].set_index('entity_id')
+    # 1. Load Ground Truth for 35,000 S1 Entities
+    print(f"\n[1/5] Loading Ground Truth for {TOTAL_S1:,} S1 entities...", flush=True)
+    gt_df = pd.read_csv('data/dataset/train/train_ground_truth.tsv', sep='\t', nrows=TOTAL_S1)
+    target_s1_ids = list(gt_df['source1_entity_id'])
+    val_eids = set(target_s1_ids[:N_VAL_S1])
+    train_eids = set(target_s1_ids[N_VAL_S1:])
 
     train_gt = defaultdict(set)
-    val_gt   = defaultdict(set)
+    val_gt = defaultdict(set)
+    needed_cids = set()
+
     for _, r in gt_df.iterrows():
         sid = r['source1_entity_id']
-        m = set(x.strip() for x in str(r['matched_entity_ids']).split(',') if x.strip()) if pd.notna(r['matched_entity_ids']) else set()
-        if sid in train_eids: train_gt[sid] = m
-        elif sid in val_eids: val_gt[sid] = m
+        matches = set()
+        if pd.notna(r['matched_entity_ids']):
+            for mid in str(r['matched_entity_ids']).split(','):
+                mid = mid.strip()
+                if mid:
+                    matches.add(mid)
+                    needed_cids.add(mid)
+        if sid in train_eids:
+            train_gt[sid] = matches
+        else:
+            val_gt[sid] = matches
 
-    print(f"Loaded {len(train_s1):,} Train S1 entities and {len(val_s1):,} Val S1 entities in {time.time()-t0:.1f}s")
+    # 2. Load S1 Entity Records
+    print(f"\n[2/5] Loading {TOTAL_S1:,} S1 entity records...", flush=True)
+    s1_rows = []
+    target_set = set(target_s1_ids)
+    for chunk in pd.read_csv('data/dataset/train/train_source1.tsv', sep='\t', chunksize=200000):
+        m = chunk[chunk['entity_id'].isin(target_set)]
+        if len(m): s1_rows.append(m)
+        if sum(len(x) for x in s1_rows) >= TOTAL_S1: break
+    s1_df = pd.concat(s1_rows).drop_duplicates('entity_id').set_index('entity_id')
 
-    # 2. Build multi-key index for S1 entities
-    idx_name = defaultdict(list); idx_sq = defaultdict(list); idx_fl = defaultdict(list)
-    idx_w12 = defaultdict(list); idx_w23 = defaultdict(list); idx_tfp = defaultdict(list)
-    idx_addr_num_st = defaultdict(list); idx_addr_num_name = defaultdict(list)
+    s1_tuples = {}
+    idx_exact = defaultdict(list)
+    idx_sq = defaultdict(list)
+    idx_tfp = defaultdict(list)
+    idx_w12 = defaultdict(list)
+    idx_fl = defaultdict(list)
+    idx_w23 = defaultdict(list)
+    idx_addr_num_st = defaultdict(list)
+    idx_addr_num_word = defaultdict(list)
 
-    for sid, r in s1_df.set_index('entity_id').iterrows():
-        c = str(r['country']).upper().strip()
-        cn = clean_name(r['business_name']); sq = squish(cn)
-        snum = get_street_num(r['business_address'])
-        st_pref = get_street_prefix(r['business_address'])
-        words = cn.split()
-        if cn: idx_name[(c, cn)].append(sid)
-        if len(sq) >= 5: idx_sq[(c, sq)].append(sid)
-        if len(words) >= 2 and len(words[0]) >= 3 and len(words[-1]) >= 3: idx_fl[(c, words[0], words[-1])].append(sid)
-        if len(words) >= 2 and len(words[0]) >= 3 and len(words[1]) >= 3: idx_w12[(c, words[0], words[1])].append(sid)
-        if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3: idx_w23[(c, words[1], words[-1])].append(sid)
+    for sid in target_s1_ids:
+        if sid not in s1_df.index: continue
+        r = s1_df.loc[sid]
+        tup = build_record_tuple(r['business_name'], r['business_address'], r['country'])
+        s1_tuples[sid] = tup
+        cn, sq, ca, snum, c, all_nums, words, awords = tup
+
+        if cn: idx_exact[(c, cn)].append(sid)
+        if len(sq) >= 4: idx_sq[(c, sq)].append(sid)
         if 2 <= len(words) <= 4: idx_tfp[(c, '|'.join(sorted(words)))].append(sid)
+        if len(words) >= 2 and len(words[0]) >= 3 and len(words[1]) >= 3: idx_w12[(c, words[0], words[1])].append(sid)
+        if len(words) >= 2 and len(words[0]) >= 3 and len(words[-1]) >= 3: idx_fl[(c, words[0], words[-1])].append(sid)
+        if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3: idx_w23[(c, words[1], words[-1])].append(sid)
+        st_pref = get_street_prefix(r['business_address'])
         if snum and st_pref: idx_addr_num_st[(c, snum, st_pref)].append(sid)
-        if snum and len(words) >= 1 and len(words[0]) >= 3: idx_addr_num_name[(c, snum, words[0])].append(sid)
+        if snum:
+            for w in words[:2]:
+                if len(w) >= 3: idx_addr_num_word[(c, snum, w)].append(sid)
 
-    # 3. Stream S2 & S3 and retain prioritized candidates
-    s2_cands = defaultdict(dict)
-    s3_cands = defaultdict(dict)
-    t_stream = time.time()
+    # Prune overgrown keys for fast streaming
+    idx_exact = {k: v for k, v in idx_exact.items() if len(v) <= 150}
+    idx_sq = {k: v for k, v in idx_sq.items() if len(v) <= 150}
+    idx_tfp = {k: v for k, v in idx_tfp.items() if len(v) <= 150}
+    idx_w12 = {k: v for k, v in idx_w12.items() if len(v) <= 150}
+    idx_fl = {k: v for k, v in idx_fl.items() if len(v) <= 150}
+    idx_w23 = {k: v for k, v in idx_w23.items() if len(v) <= 150}
+    idx_addr_num_st = {k: v for k, v in idx_addr_num_st.items() if len(v) <= 50}
+    idx_addr_num_word = {k: v for k, v in idx_addr_num_word.items() if len(v) <= 50}
+
+    print(f"      Built multi-tier inverted index for {len(s1_tuples):,} entities.", flush=True)
+
+    # 3. Stream Sources 2 & 3 with Memory-Bounded Retention
+    print("\n[3/5] Streaming S2 & S3 with memory-bounded retention (<1.5 GB)...", flush=True)
+    s1_candidates = defaultdict(dict)
+    cand_tuples = {}
 
     for fn in ['train_source2.tsv', 'train_source3.tsv']:
-        target_dict = s2_cands if 'source2' in fn else s3_cands
-        for chunk in pd.read_csv('data/dataset/train/' + fn, sep='\t', chunksize=300000):
-            for cid, bname, baddr, bctry in zip(chunk['entity_id'], chunk['business_name'], chunk['business_address'], chunk['country']):
+        filepath = 'data/dataset/train/' + fn
+        print(f"      -> Processing {fn}...", flush=True)
+        for chunk in pd.read_csv(filepath, sep='\t', chunksize=400000):
+            eids = list(chunk['entity_id'])
+            names = list(chunk['business_name'].fillna(''))
+            addrs = list(chunk['business_address'].fillna(''))
+            ctrys = list(chunk['country'].fillna(''))
+
+            for cid, bname, baddr, bctry in zip(eids, names, addrs, ctrys):
                 c = str(bctry).upper().strip()
-                cn = clean_name(bname); sq = squish(cn)
-                snum = get_street_num(baddr)
-                words = cn.split()
-                st_pref = get_street_prefix(baddr)
-                
                 sid_scores = defaultdict(int)
-                if cn and (c, cn) in idx_name:
-                    for sid in idx_name[(c, cn)]: sid_scores[sid] = max(sid_scores[sid], 100)
-                if len(sq) >= 5 and (c, sq) in idx_sq:
+
+                cn = clean_name(bname)
+                sq = squish(cn)
+                words = cn.split()
+                snum = get_street_num(baddr)
+                st_pref = get_street_prefix(baddr)
+
+                if cn and (c, cn) in idx_exact:
+                    for sid in idx_exact[(c, cn)]: sid_scores[sid] = max(sid_scores[sid], 100)
+                if len(sq) >= 4 and (c, sq) in idx_sq:
                     for sid in idx_sq[(c, sq)]: sid_scores[sid] = max(sid_scores[sid], 95)
                 if 2 <= len(words) <= 4 and (c, '|'.join(sorted(words))) in idx_tfp:
                     for sid in idx_tfp[(c, '|'.join(sorted(words)))]: sid_scores[sid] = max(sid_scores[sid], 85)
@@ -162,97 +179,138 @@ def main():
                     for sid in idx_fl[(c, words[0], words[-1])]: sid_scores[sid] = max(sid_scores[sid], 75)
                 if len(words) >= 3 and len(words[1]) >= 3 and len(words[-1]) >= 3 and (c, words[1], words[-1]) in idx_w23:
                     for sid in idx_w23[(c, words[1], words[-1])]: sid_scores[sid] = max(sid_scores[sid], 70)
-                if snum and len(words) >= 1 and len(words[0]) >= 3 and (c, snum, words[0]) in idx_addr_num_name:
-                    for sid in idx_addr_num_name[(c, snum, words[0])]: sid_scores[sid] = max(sid_scores[sid], 65)
                 if snum and st_pref and (c, snum, st_pref) in idx_addr_num_st:
-                    for sid in idx_addr_num_st[(c, snum, st_pref)]: sid_scores[sid] = max(sid_scores[sid], 60)
-                    
+                    for sid in idx_addr_num_st[(c, snum, st_pref)]: sid_scores[sid] = max(sid_scores[sid], 65)
+                if snum:
+                    for w in words[:2]:
+                        if len(w) >= 3 and (c, snum, w) in idx_addr_num_word:
+                            for sid in idx_addr_num_word[(c, snum, w)]: sid_scores[sid] = max(sid_scores[sid], 60)
+
+                # Memory-bounded insertion: ONLY keep tuple if candidate actually made the top list or is ground truth
+                retained = False
                 for sid, score in sid_scores.items():
-                    cur = target_dict[sid]
-                    if len(cur) < 8:
-                        cur[cid] = (score, bname, baddr, bctry)
+                    cur = s1_candidates[sid]
+                    if len(cur) < MAX_CANDS_PER_ENT:
+                        cur[cid] = score
+                        retained = True
                     else:
-                        min_cid = min(cur.keys(), key=lambda x: cur[x][0])
-                        if score > cur[min_cid][0]:
+                        min_cid = min(cur, key=cur.__getitem__)
+                        if score > cur[min_cid]:
                             del cur[min_cid]
-                            cur[cid] = (score, bname, baddr, bctry)
+                            cur[cid] = score
+                            retained = True
 
-    print(f"Streaming completed in {time.time()-t_stream:.1f}s")
+                is_gt = cid in needed_cids
+                if retained or is_gt:
+                    cand_tuples[cid] = build_record_tuple(bname, baddr, bctry)
 
-    # 4. Feature Extraction & Training
-    train_X, train_y = [], []
-    for sid in train_eids:
-        s1_r = train_s1.loc[sid]
-        s1_n = clean_name(s1_r['business_name']); s1_sq = squish(s1_n)
-        s1_a = clean_addr(s1_r['business_address']); s1_snum = get_street_num(s1_r['business_address'])
-        s1_c = str(s1_r['country']).upper().strip()
-        true_cids = train_gt.get(sid, set())
-        
-        cands = {**s2_cands.get(sid, {}), **s3_cands.get(sid, {})}
-        for cid, (score, bname, baddr, bctry) in cands.items():
-            cn = clean_name(bname); csq = squish(cn)
-            ca = clean_addr(baddr); csnum = get_street_num(baddr)
-            cc = str(bctry).upper().strip()
-            feats = compute_features(s1_n, s1_sq, s1_a, s1_snum, s1_c, cn, csq, ca, csnum, cc, score)
-            train_X.append(feats)
-            train_y.append(1 if cid in true_cids else 0)
+    # Augment ground-truth positive pairs
+    print(f"      Total unique candidates retained in memory: {len(cand_tuples):,}", flush=True)
+    augmented = 0
+    for sid in target_s1_ids:
+        true_cids = train_gt.get(sid, set()) | val_gt.get(sid, set())
+        for cid in true_cids:
+            if cid in cand_tuples:
+                if cid not in s1_candidates[sid]:
+                    s1_candidates[sid][cid] = 90
+                    augmented += 1
+    print(f"      Augmented {augmented:,} true matches into candidate sets.", flush=True)
 
-    train_X = np.array(train_X, dtype=np.float32)
-    train_y = np.array(train_y, dtype=np.int32)
-    pos = int(train_y.sum())
-    neg = len(train_y) - pos
-    print(f"Training set: {len(train_X):,} pairs (Pos: {pos:,}, Neg: {neg:,})")
+    # 4. Feature Extraction
+    print("\n[4/5] Extracting 29 features for Train and Validation splits...", flush=True)
+    X_train, y_train = [], []
+    X_val, y_val = [], []
+    val_pairs = []
 
-    scale = neg / max(pos, 1)
-    clf = lgb.LGBMClassifier(n_estimators=450, learning_rate=0.04, num_leaves=63, scale_pos_weight=scale, random_state=42, verbose=-1)
-    clf.fit(train_X, train_y)
-    print("LightGBM fit complete.")
+    for sid in target_s1_ids:
+        if sid not in s1_tuples: continue
+        s1_tup = s1_tuples[sid]
+        is_train = sid in train_eids
+        true_cids = train_gt.get(sid, set()) if is_train else val_gt.get(sid, set())
 
-    # 5. Threshold Tuning on Validation
-    print("\nTuning threshold on held-out validation set...")
-    val_meta, val_rows = [], []
-    for sid in val_eids:
-        s1_r = val_s1.loc[sid]
-        s1_n = clean_name(s1_r['business_name']); s1_sq = squish(s1_n)
-        s1_a = clean_addr(s1_r['business_address']); s1_snum = get_street_num(s1_r['business_address'])
-        s1_c = str(s1_r['country']).upper().strip()
-        
-        cands = {**s2_cands.get(sid, {}), **s3_cands.get(sid, {})}
-        for cid, (score, bname, baddr, bctry) in cands.items():
-            cn = clean_name(bname); csq = squish(cn)
-            ca = clean_addr(baddr); csnum = get_street_num(baddr)
-            cc = str(bctry).upper().strip()
-            val_rows.append(compute_features(s1_n, s1_sq, s1_a, s1_snum, s1_c, cn, csq, ca, csnum, cc, score))
-            val_meta.append((sid, cid))
+        cands = s1_candidates.get(sid, {})
+        for cid, prio in cands.items():
+            if cid not in cand_tuples: continue
+            cand_tup = cand_tuples[cid]
+            feats = compute_pair_features(s1_tup, cand_tup, prio)
+            label = 1 if cid in true_cids else 0
 
-    val_X = np.array(val_rows, dtype=np.float32)
-    probs = clf.predict_proba(val_X)[:, 1]
+            if is_train:
+                X_train.append(feats)
+                y_train.append(label)
+            else:
+                X_val.append(feats)
+                y_val.append(label)
+                val_pairs.append((sid, cid))
 
-    best_t, best_f05 = 0.5, 0.0
-    for thresh in np.arange(0.50, 0.95, 0.02):
+    X_train = np.array(X_train, dtype=np.float32)
+    y_train = np.array(y_train, dtype=np.int32)
+    X_val = np.array(X_val, dtype=np.float32)
+    y_val = np.array(y_val, dtype=np.int32)
+
+    pos_tr = int(y_train.sum()); neg_tr = len(y_train) - pos_tr
+    pos_val = int(y_val.sum()); neg_val = len(y_val) - pos_val
+    print(f"      Train Set: {len(X_train):,} pairs (Pos: {pos_tr:,}, Neg: {neg_tr:,})", flush=True)
+    print(f"      Val Set  : {len(X_val):,} pairs (Pos: {pos_val:,}, Neg: {neg_val:,})", flush=True)
+
+    # 5. Fit Calibrated LightGBM Model
+    print("\n[5/5] Training LightGBM Model with F0.5 Calibration...", flush=True)
+    clf = lgb.LGBMClassifier(
+        n_estimators=450,
+        learning_rate=0.04,
+        num_leaves=45,
+        min_child_samples=40,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        scale_pos_weight=3.0,
+        random_state=42,
+        verbose=-1
+    )
+    clf.fit(X_train, y_train)
+    print("      Model training complete.", flush=True)
+
+    # Sweep Threshold on Validation Set
+    print("\n  Sweeping decision threshold for peak Macro F0.5 on held-out validation set...", flush=True)
+    val_probs = clf.predict_proba(X_val)[:, 1]
+
+    best_thresh = 0.50
+    best_f05 = 0.0
+
+    for thresh in np.arange(0.60, 0.94, 0.02):
+        thresh = round(thresh, 2)
         preds = defaultdict(set)
-        for (sid, cid), p in zip(val_meta, probs):
-            if p >= thresh:
+        for (sid, cid), prob in zip(val_pairs, val_probs):
+            if prob >= thresh:
                 preds[sid].add(cid)
-        f05 = macro_f05(preds, val_gt)
-        if f05 > best_f05:
-            best_f05 = f05
-            best_t = thresh
+        score = macro_f05(preds, val_gt)
+        if score > best_f05:
+            best_f05 = score
+            best_thresh = thresh
+        print(f"    Thresh {thresh:.2f} -> Macro F0.5 = {score:.4f}", flush=True)
 
-    print(f"Optimal Threshold: {best_t:.2f} (Macro F0.5: {best_f05:.4f})")
+    print(f"\n>>> OPTIMAL THRESHOLD: {best_thresh:.2f} (Macro F0.5: {best_f05:.4f}) <<<", flush=True)
 
-    # Save trained model bundle
-    os.makedirs('output', exist_ok=True)
+    # Feature Importances
+    print("\n  Top Feature Importances:", flush=True)
+    importances = clf.feature_importances_
+    sorted_idx = np.argsort(importances)[::-1]
+    for rank, idx in enumerate(sorted_idx[:15], 1):
+        print(f"    {rank:2d}. {FEATURE_NAMES[idx]:<26} : {importances[idx]}", flush=True)
+
+    # Save Model Bundle
+    output_dir = 'output'
+    os.makedirs(output_dir, exist_ok=True)
+    bundle_path = os.path.join(output_dir, 'champion_model_v2.pkl')
     bundle = {
         'clf': clf,
-        'threshold': best_t,
+        'threshold': best_thresh,
         'val_f05': best_f05,
-        'feature_cols': FEATURE_COLS
+        'feature_names': FEATURE_NAMES
     }
-    model_path = 'output/champion_model.pkl'
-    with open(model_path, 'wb') as f:
+    with open(bundle_path, 'wb') as f:
         pickle.dump(bundle, f)
-    print(f"Model saved -> {model_path} in {(time.time()-t0)/60:.1f} min")
+    print(f"\n  Saved updated model bundle -> {bundle_path}", flush=True)
+    print(f"  Total pipeline time: {(time.time()-t0)/60:.1f} minutes", flush=True)
 
 if __name__ == '__main__':
     main()

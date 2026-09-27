@@ -1,305 +1,169 @@
 """
 preprocessing.py
 ================
-Business name and address normalization utilities.
+Enterprise-grade normalization for Multilingual Business Entity Resolution
+(Amazon ML Challenge 2026).
 
-Key responsibilities:
-  - Clean and normalize business names (abbreviation expansion, punctuation, lower-case)
-  - Clean and normalize addresses (abbreviation expansion, token sorting)
-  - Provide tokenized versions for downstream similarity features
-
-Performance notes (fixed):
-  - _apply_abbrev used to run one re.sub() PER abbreviation (30 for names, 24 for
-    addresses), each scanning the full string. That is 30/24 full passes per row,
-    which does not scale to millions of rows. It is now a single compiled
-    alternation regex -> one pass per string.
-  - normalize_name/normalize_address used to rely on functools.lru_cache(32768).
-    With 2M+ unique business names, a cache that small gets evicted constantly
-    and provides little benefit. preprocess_dataframe now normalizes only the
-    *unique* values in each column and maps the results back, which is a much
-    bigger win than lru_cache at this cardinality (repeats are common, but the
-    unique count still exceeds a small LRU cache).
+Handles:
+  1. AnyAscii transliteration (Indic scripts, European diacritics, Cyrillic, etc.)
+  2. Web prefixes & domain suffixes (www., http://, .com, .in, .org, .fr, etc.)
+  3. DBA / Trade name variations (d/b/a, dba, t/a, ta, trading as)
+  4. Honorific / Salutation prefixes (Dr, Sri, Shree, Shri, M/s, Mr, Mrs, Prof, Er, CA)
+  5. Legal entity designations (English, French, Transliterated Indic: LLP, Pvt Ltd, SARL, SAS, elelpi, praivet, etc.)
+  6. Country-specific address normalization (Indian states/cities, French street types)
 """
 
 import re
-import unicodedata
-from functools import lru_cache
+import anyascii
 
 # ---------------------------------------------------------------------------
-# Abbreviation maps
+# Country-Specific Synonym Dictionaries
 # ---------------------------------------------------------------------------
 
-NAME_ABBREV = {
-    r"\bcorp\b": "corporation",
-    r"\bco\b": "company",
-    r"\binc\b": "incorporated",
-    r"\bltd\b": "limited",
-    r"\bllc\b": "limited liability company",
-    r"\bllp\b": "limited liability partnership",
-    r"\bpvt\b": "private",
-    r"\bpte\b": "private",
-    r"\bsdn\b": "sendirian",
-    r"\bbhd\b": "berhad",
-    r"\bplc\b": "public limited company",
-    r"\bgmbh\b": "gesellschaft mit beschrankter haftung",
-    r"\bsa\b": "societe anonyme",
-    r"\bsas\b": "societe par actions simplifiee",
-    r"\bsarl\b": "societe a responsabilite limitee",
-    r"\bintl\b": "international",
-    r"\bint l\b": "international",
-    r"\bmfg\b": "manufacturing",
-    r"\bsvcs\b": "services",
-    r"\bsvc\b": "service",
-    r"\bmgmt\b": "management",
-    r"\bassoc\b": "associates",
-    r"\bassn\b": "association",
-    r"\bdept\b": "department",
-    r"\bgrp\b": "group",
-    r"\btech\b": "technology",
-    r"\bsoln\b": "solution",
-    r"\bsolns\b": "solutions",
-    r"\benterprises\b": "enterprise",
-    r"\bnatl\b": "national",
+INDIAN_STATE_SYNONYMS = {
+    r'\bup\b': 'uttar pradesh', r'\bmh\b': 'maharashtra', r'\btn\b': 'tamil nadu',
+    r'\bka\b': 'karnataka', r'\bdl\b': 'delhi', r'\bwb\b': 'west bengal',
+    r'\bgj\b': 'gujarat', r'\brj\b': 'rajasthan', r'\bts\b': 'telangana',
+    r'\bap\b': 'andhra pradesh', r'\bkl\b': 'kerala', r'\bhr\b': 'haryana',
+    r'\bmp\b': 'madhya pradesh', r'\bpb\b': 'punjab', r'\bod\b': 'odisha',
+    r'\bjh\b': 'jharkhand', r'\bbr\b': 'bihar', r'\bcg\b': 'chhattisgarh',
+    r'\bga\b': 'goa', r'\bas\b': 'assam',
+    r'\bbengaluru\b': 'bangalore', r'\bmumbai\b': 'bombay',
+    r'\bchennai\b': 'madras', r'\bkolkata\b': 'calcutta',
+    r'\bvadodara\b': 'baroda', r'\bgurugram\b': 'gurgaon',
+    r'\bpune\b': 'poona', r'\bkochi\b': 'cochin',
 }
 
-ADDRESS_ABBREV = {
-    r"\brd\b": "road",
-    r"\bst\b": "street",
-    r"\bave\b": "avenue",
-    r"\bblvd\b": "boulevard",
-    r"\bdr\b": "drive",
-    r"\bct\b": "court",
-    r"\bln\b": "lane",
-    r"\bpl\b": "place",
-    r"\bpkwy\b": "parkway",
-    r"\bhwy\b": "highway",
-    r"\bfwy\b": "freeway",
-    r"\bsq\b": "square",
-    r"\bapt\b": "apartment",
-    r"\bste\b": "suite",
-    r"\bfl\b": "floor",
-    r"\bflr\b": "floor",
-    r"\bbldg\b": "building",
-    r"\bctr\b": "center",
-    r"\bjn\b": "junction",
-    r"\bnear\b": "near",
-    r"\bopp\b": "opposite",
-    r"\bnh\b": "national highway",
-    r"\bsh\b": "state highway",
-    r"\bno\b": "number",
+FRENCH_STREET_SYNONYMS = {
+    r'\br\b': 'rue', r'\brue\b': 'rue',
+    r'\bav\b': 'avenue', r'\bave\b': 'avenue',
+    r'\bbd\b': 'boulevard', r'\bblvd\b': 'boulevard',
+    r'\ball\b': 'allee', r'\ballee\b': 'allee',
+    r'\bch\b': 'chemin', r'\bchemin\b': 'chemin',
+    r'\bimp\b': 'impasse', r'\bimpasse\b': 'impasse',
+    r'\bpl\b': 'place', r'\bplace\b': 'place',
+    r'\bpass\b': 'passage', r'\bpassage\b': 'passage',
+    r'\brt\b': 'route', r'\broute\b': 'route',
+    r'\bquai\b': 'quai',
 }
 
-STOPWORDS = {
-    "the", "a", "an", "of", "for", "and", "in", "at", "by", "to", "is",
-    "on", "with", "de", "la", "le", "les", "du", "des", "van", "der",
-}
+# Compiled regexes for fast execution
+RE_WEB = re.compile(r'\b(https?://|www\.)', re.IGNORECASE)
+RE_DOMAINS = re.compile(r'\.(com|in|org|net|co|io|fr|biz|info|gov|edu)\b', re.IGNORECASE)
+RE_NON_ALPHANUM = re.compile(r'[^a-z0-9\s]')
+RE_HONORIFICS = re.compile(r'^(dr|mr|mrs|ms|prof|sri|shree|shri|m/s|m\s+s|er|ca)\b\s*', re.IGNORECASE)
+RE_LEGAL_SUFFIXES = re.compile(
+    r'\b(inc|corp|corporation|incorporated|llc|pllc|ltd|limited|co|company|'
+    r'pvt|private|llp|pc|sarl|sas|sasu|sa|eurl|snc|sci|gie|praivet|limitid|'
+    r'limiteed|elelpi|pvtltd)\b',
+    re.IGNORECASE
+)
+RE_ADDR_NOISE = re.compile(
+    r'\b(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|'
+    r'suite|ste|apt|floor|fl|near|opp|behind|beside|flat|plot|no|bldg|building|chambers|tower)\b',
+    re.IGNORECASE
+)
 
 # ---------------------------------------------------------------------------
-# Core helpers
+# Normalization Functions
 # ---------------------------------------------------------------------------
 
-def _unicode_normalize(text: str) -> str:
-    nfkd = unicodedata.normalize("NFKD", text)
-    return nfkd.encode("ascii", "ignore").decode("ascii")
-
-
-def _compile_abbrev(abbrev_map: dict):
+def clean_name(s: str) -> str:
     """
-    Combine many `\\bword\\b -> replacement` rules into ONE compiled
-    alternation regex, so each string is scanned once instead of once
-    per abbreviation.
-
-    Multi-word patterns like `\\bint l\\b` are supported: the literal
-    inner text (with internal whitespace normalized to a single space)
-    is used as the alternative and matched as-is.
+    Standardize business names:
+    - Transliterate Unicode/Indic scripts to Latin ASCII
+    - Strip URLs, domains, and web prefixes
+    - Separate DBAs
+    - Strip honorifics/salutations
+    - Strip legal entity suffixes
     """
-    lookup = {}
-    parts = []
-    for pattern, replacement in abbrev_map.items():
-        # Strip a leading/trailing \b and normalize internal whitespace
-        # (handles both "\bword\b" and "\bmulti word\b" cases).
-        word = pattern
-        if word.startswith(r"\b"):
-            word = word[2:]
-        if word.endswith(r"\b"):
-            word = word[:-2]
-        word = re.sub(r"\s+", " ", word).strip()
-        lookup[word] = replacement
-        parts.append(re.escape(word).replace(r"\ ", r"\s+"))
-
-    # Longer alternatives first so multi-word patterns aren't shadowed
-    # by a shorter single-word prefix.
-    parts.sort(key=len, reverse=True)
-    combined = re.compile(r"\b(" + "|".join(parts) + r")\b")
-
-    def _sub(text: str) -> str:
-        def _repl(m: "re.Match") -> str:
-            key = re.sub(r"\s+", " ", m.group(0)).strip()
-            return lookup.get(key, m.group(0))
-        return combined.sub(_repl, text)
-
-    return _sub
-
-
-_apply_name_abbrev = _compile_abbrev(NAME_ABBREV)
-_apply_address_abbrev = _compile_abbrev(ADDRESS_ABBREV)
+    if not isinstance(s, str) or not s:
+        return ''
+    
+    # 1. Transliterate (e.g. Hindi, Kannada, Telugu, Tamil, French accents)
+    s = anyascii.anyascii(s).lower()
+    
+    # 2. Strip web artifacts
+    s = RE_WEB.sub('', s)
+    s = RE_DOMAINS.sub('', s)
+    
+    # 3. Handle DBA / Trade name separators
+    for sep in [' d/b/a ', ' dba ', ' t/a ', ' ta ', ' trading as ']:
+        if sep in s:
+            s = s.split(sep)[-1]
+            break
+            
+    # 4. Remove punctuation
+    s = RE_NON_ALPHANUM.sub(' ', s)
+    
+    # 5. Remove honorifics (e.g. Dr, Sri, Shree, M/s)
+    s = RE_HONORIFICS.sub('', s)
+    
+    # 6. Remove legal suffixes (English, French, Indic transliterations)
+    s = RE_LEGAL_SUFFIXES.sub(' ', s)
+    
+    return ' '.join(s.split())
 
 
-def _apply_abbrev(text: str, abbrev_map: dict) -> str:
-    """Kept for backwards compatibility / debugging (slow path, not used
-    internally anymore)."""
-    for pattern, replacement in abbrev_map.items():
-        text = re.sub(pattern, replacement, text)
-    return text
+def squish(s: str) -> str:
+    """Compact slug without whitespace for robust exact/phonetic matching."""
+    s = re.sub(r'\b(com|org|net|in|fr|io|co|biz|info)\b', '', s)
+    return s.replace(' ', '')
 
 
-# ---------------------------------------------------------------------------
-# Business name normalization
-# ---------------------------------------------------------------------------
-
-@lru_cache(maxsize=32768)
-def normalize_name(name: str) -> str:
-    if not isinstance(name, str) or not name.strip():
-        return ""
-    text = _unicode_normalize(name)
-    text = text.lower()
-    text = re.sub(r"&", " and ", text)
-    text = re.sub(r"[^\w\s'-]", " ", text)
-    text = re.sub(r"[-']", " ", text)
-    text = _apply_name_abbrev(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def tokenize_name(name: str, remove_stopwords: bool = True):
-    tokens = normalize_name(name).split()
-    if remove_stopwords:
-        tokens = [t for t in tokens if t not in STOPWORDS]
-    return tokens
-
-
-def name_first_token(name: str) -> str:
-    tokens = tokenize_name(name, remove_stopwords=False)
-    return tokens[0] if tokens else ""
-
-
-def name_first_char(name: str) -> str:
-    n = normalize_name(name)
-    return n[0] if n else ""
-
-
-def name_prefix(name: str, length: int = 3) -> str:
-    n = normalize_name(name)
-    return n[:length]
-
-
-# ---------------------------------------------------------------------------
-# Address normalization
-# ---------------------------------------------------------------------------
-
-@lru_cache(maxsize=32768)
-def normalize_address(address: str) -> str:
-    if not isinstance(address, str) or not address.strip():
-        return ""
-    text = _unicode_normalize(address)
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = _apply_address_abbrev(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def tokenize_address(address: str):
-    return normalize_address(address).split()
-
-
-def address_first_token(address: str) -> str:
-    tokens = tokenize_address(address)
-    return tokens[0] if tokens else ""
-
-
-# ---------------------------------------------------------------------------
-# Country normalization
-# ---------------------------------------------------------------------------
-
-COUNTRY_MAP = {
-    "usa": "us",
-    "united states": "us",
-    "united states of america": "us",
-    "america": "us",
-    "india": "in",
-    "ind": "in",
-    "bharat": "in",
-    "france": "fr",
-    "french republic": "fr",
-    "republique francaise": "fr",
-}
-
-
-def normalize_country(country: str) -> str:
-    if not isinstance(country, str):
-        return ""
-    c = country.lower().strip()
-    return COUNTRY_MAP.get(c, c)
-
-
-# ---------------------------------------------------------------------------
-# DataFrame-level application
-# ---------------------------------------------------------------------------
-
-def _map_via_unique(series, func, label=""):
+def clean_addr(s: str, country: str = '') -> str:
     """
-    Apply `func` to only the unique values of `series`, then map results
-    back. Much faster than series.map(func) directly when there are many
-    repeated values and/or the value cardinality exceeds a small
-    lru_cache, since each distinct value is computed exactly once
-    regardless of cache size or eviction.
+    Standardize addresses:
+    - Transliterate Indic and accented characters
+    - Remove common street noise words
+    - Expand country-specific abbreviations
     """
-    uniques = series.unique()
-    if label:
-        print(f"    {label}: {len(series):,} rows -> {len(uniques):,} unique values")
-    mapping = {v: func(v) for v in uniques}
-    return series.map(mapping)
+    if not isinstance(s, str) or not s:
+        return ''
+    
+    s = anyascii.anyascii(s).lower()
+    s = RE_NON_ALPHANUM.sub(' ', s)
+    s = RE_ADDR_NOISE.sub(' ', s)
+    
+    country_upper = str(country).upper().strip()
+    if country_upper == 'FRANCE':
+        for pat, repl in FRENCH_STREET_SYNONYMS.items():
+            s = re.sub(pat, repl, s)
+    elif country_upper == 'INDIA':
+        for pat, repl in INDIAN_STATE_SYNONYMS.items():
+            s = re.sub(pat, repl, s)
+            
+    return ' '.join(s.split())
 
 
-def preprocess_dataframe(df, verbose: bool = True):
-    df = df.copy()
-    n = len(df)
-    if verbose:
-        print(f"  preprocessing {n:,} rows...")
+def get_street_num(addr: str) -> str:
+    """Extract first street number."""
+    if not isinstance(addr, str) or not addr:
+        return ''
+    nums = re.findall(r'\b\d+\b', addr)
+    return nums[0] if nums else ''
 
-    business_name = df["business_name"].fillna("")
-    business_address = df["business_address"].fillna("")
-    country = df["country"].fillna("")
 
-    df["norm_name"] = _map_via_unique(
-        business_name, normalize_name, "norm_name" if verbose else ""
-    )
-    df["norm_address"] = _map_via_unique(
-        business_address, normalize_address, "norm_address" if verbose else ""
-    )
-    df["norm_country"] = _map_via_unique(
-        country, normalize_country, "norm_country" if verbose else ""
-    )
+def get_all_nums(addr: str) -> set:
+    """Extract all numeric tokens from address."""
+    if not isinstance(addr, str) or not addr:
+        return set()
+    return set(re.findall(r'\b\d+\b', addr))
 
-    df["name_tokens"] = _map_via_unique(
-        df["norm_name"],
-        lambda x: tokenize_name(x, remove_stopwords=True),
-        "name_tokens" if verbose else "",
-    )
-    df["address_tokens"] = _map_via_unique(
-        df["norm_address"], tokenize_address, "address_tokens" if verbose else ""
-    )
-    df["name_first_token"] = _map_via_unique(
-        df["norm_name"], name_first_token, "name_first_token" if verbose else ""
-    )
-    df["name_prefix3"] = _map_via_unique(
-        df["norm_name"], lambda x: name_prefix(x, 3), "name_prefix3" if verbose else ""
-    )
-    df["name_first_char"] = _map_via_unique(
-        df["norm_name"], name_first_char, "name_first_char" if verbose else ""
-    )
 
-    if verbose:
-        print(f"  done preprocessing {n:,} rows.")
-    return df
+def get_street_prefix(addr: str) -> str:
+    """Extract 3-letter prefix of first non-numeric word in address."""
+    if not isinstance(addr, str) or not addr:
+        return ''
+    ca = clean_name(addr)
+    words = [w for w in ca.split() if not w.isdigit() and len(w) >= 3 and w != 'rue']
+    return words[0][:3] if words else ''
+
+
+def get_distinctive_address_tokens(addr: str, country: str = '') -> list:
+    """Extract long locality/city/state tokens from address."""
+    if not isinstance(addr, str) or not addr:
+        return []
+    ca = clean_addr(addr, country)
+    words = [w for w in ca.split() if not w.isdigit() and len(w) >= 4]
+    return words[-4:] if len(words) >= 4 else words
